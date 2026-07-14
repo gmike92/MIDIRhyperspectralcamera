@@ -6,22 +6,22 @@ function phase_analyser()
 % interferogram_position_mm [z,scan]. Older files may use the auto-detected
 % <mat-file-stem>_interferogram_positions_mm.tsv sidecar.
 
-[mat_file, mat_path] = uigetfile('*.mat', 'Choose thermal hologram MAT file');
+[mat_file, mat_path] = uigetfile('*.mat', 'Choose hyperspectral dataset MAT file');
 if isequal(mat_file, 0), return; end
 mat_full_path = fullfile(mat_path, mat_file);
-loaded = load(mat_full_path, 'thermal_hologram');
-if ~isfield(loaded, 'thermal_hologram')
-    error('The selected file does not contain thermal_hologram.');
+loaded = load(mat_full_path);
+if ~isfield(loaded, 'raw_interferogram')
+    error('The selected file does not contain raw_interferogram temporal hypercube.');
 end
-H = loaded.thermal_hologram;
-required_fields = {'interferogram', 'z_mm', 'wavelength_um'};
+
+required_fields = {'raw_interferogram', 'twins_positions_calibrated_mm', 'wavelengths'};
 for field_index = 1:numel(required_fields)
     if ~isfield(H, required_fields{field_index})
-        error('thermal_hologram is missing required field: %s', required_fields{field_index});
+        error('dataset is missing required field: %s', required_fields{field_index});
     end
 end
 if ~isnumeric(H.interferogram) || ndims(H.interferogram) ~= 4
-    error('thermal_hologram.interferogram must be [z, x, y, scan].');
+    error('raw_interferogram.interferogram must be [z, x, y, scan].');
 end
 interferogram = H.interferogram;
 z_mm = double(H.z_mm(:));
