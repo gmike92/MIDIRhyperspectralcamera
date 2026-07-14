@@ -1,0 +1,13 @@
+# MIDIR hyperspectral camera app (PyQt6). 64-bit Python 3.8-3.12.
+PyQt6
+pyqtgraph
+numpy
+scipy
+pandas
+Pillow
+loguru
+pythonnet
+# Plus, for the real camera + stages (not needed for `--mode mock`):
+#  - Pleora eBUS runtime, system-wide  (Common Files\Pleora\eBUS SDK\PvDotNet.dll)
+#  - Thorlabs Kinesis                  (delay stage + rotator, KDC101)
+#  - SmarAct SCU3D driver              (TWINS wedge: SCU3DControl.dll)

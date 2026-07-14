@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- PyInstaller / build output ---
+build/
+dist/
+*.spec
+
+# --- Runtime logs & data (machine-specific, not source) ---
+logs/
+*.log
+out/
+*.npz
+*.npy
+*.tif
+*.tiff
+
+# --- Large demo animations (keep the repo lean) ---
+*.gif
+
+# --- Qt / OS cruft ---
+*.ini
+Thumbs.db
+.DS_Store
+
+# --- Editor ---
+.vscode/
+.idea/
