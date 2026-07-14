@@ -1,4 +1,4 @@
-function thermal_hologram_gui_export7_redo_FFT()
+function phase_analyser()
 % Recompute one z plane from interferograms and display side-by-side XY
 % amplitude and wrapped phase. Reconstruction matches HyperspectralAnalyzer.exe.
 %
