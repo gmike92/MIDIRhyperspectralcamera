@@ -184,6 +184,33 @@ def _get_cmap(name):
         return None
 
 
+def _bwr_cmap():
+    """Diverging blue-white-red map (blue = -π, white = 0, red = +π)."""
+    return pg.ColorMap(pos=[0.0, 0.5, 1.0],
+                       color=[(0, 0, 255), (255, 255, 255), (255, 0, 0)])
+
+
+# Selectable colormaps for the wrapped-phase image. 'blue-white-red' is the
+# default (signed, diverging); 'cyclic (CET-C1)' is topologically correct for
+# wrapped phase; the rest fall through to the shared resolver / pyqtgraph.
+PHASE_CMAPS = ["blue-white-red", "cyclic (CET-C1)", "turbo", "jet", "grey"]
+
+
+def _phase_cmap(name):
+    key = str(name).lower()
+    if key in ("blue-white-red", "bwr"):
+        return _bwr_cmap()
+    if key.startswith("cyclic"):
+        try:
+            cm = pg.colormap.get("CET-C1")
+            if cm is not None:
+                return cm
+        except Exception:  # noqa: BLE001
+            pass
+    cm = _get_cmap(name)
+    return cm if cm is not None else _bwr_cmap()
+
+
 _ROI_COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#e64980"]
 
 # Distinct, bright categorical palette for K-means clusters -- used for BOTH the
@@ -568,16 +595,18 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         vb_p.setAspectLocked(True); vb_p.invertY(True)
         vb_p.setBackgroundColor(pg.mkColor(200, 200, 200))
         self.ph_img_phase = pg.ImageItem(); vb_p.addItem(self.ph_img_phase)
-        try:
-            _cyc = pg.colormap.get("CET-C1")           # cyclic map for wrapped phase
-        except Exception:  # noqa: BLE001
-            _cyc = _get_cmap("jet")
-        self.ph_cbar_phase = pg.ColorBarItem(interactive=False, colorMap=_cyc,
+        self.ph_cbar_phase = pg.ColorBarItem(interactive=False,
+                                             colorMap=_phase_cmap(PHASE_CMAPS[0]),
                                              values=(-np.pi, np.pi))
         self.ph_glw.addItem(self.ph_cbar_phase, row=1, col=3)
         self.ph_cbar_phase.setImageItem(self.ph_img_phase)
         ph.addWidget(self.ph_glw, 1)
         pc = QtWidgets.QHBoxLayout()
+        pc.addWidget(QtWidgets.QLabel("Phase colors"))
+        self.ph_cmap_combo = QtWidgets.QComboBox()
+        self.ph_cmap_combo.addItems(PHASE_CMAPS)
+        self.ph_cmap_combo.currentTextChanged.connect(self._on_phase_cmap)
+        pc.addWidget(self.ph_cmap_combo)
         pc.addWidget(QtWidgets.QLabel("Phase mask below"))
         self.ph_thresh = QtWidgets.QDoubleSpinBox()
         self.ph_thresh.setRange(0.0, 100.0); self.ph_thresh.setValue(5.0)
@@ -1292,6 +1321,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         if (getattr(self, "phase_tab", None) is not None
                 and self.tabs.currentWidget() is self.phase_tab):
             self._update_phase()
+
+    def _on_phase_cmap(self, *a):
+        """Recolor the wrapped-phase map (colormap only -- no DFT recompute)."""
+        cm = _phase_cmap(self.ph_cmap_combo.currentText())
+        self.ph_cbar_phase.setColorMap(cm)
+        self.ph_img_phase.setColorMap(cm)
 
     def _update_phase(self, *a):
         """Recompute the complex per-pixel DFT at the current λ / plane and draw
