@@ -213,6 +213,16 @@ def _phase_cmap(name):
 
 _ROI_COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#e64980"]
 
+# Palette for clicked-pixel spectra / interferograms (kept distinct from the ROI
+# colours so pixels and regions never clash). Each selected pixel keeps the same
+# colour in both the spectra plot and the interferogram plot.
+_PIXEL_COLORS = ["#e8590c", "#7048e8", "#0ca678", "#f03e3e", "#1098ad",
+                 "#d6336c", "#f59f00", "#4263eb", "#37b24d", "#c2255c"]
+
+
+def _pixel_color(i):
+    return _PIXEL_COLORS[i % len(_PIXEL_COLORS)]
+
 # Distinct, bright categorical palette for K-means clusters -- used for BOTH the
 # map and the per-cluster spectra so they match, and none is black/dark (which
 # would vanish on the dark spectra plot). 16 colours = max cluster count.
@@ -315,7 +325,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._svd_cum = None           # cached cumulative explained variance
         self._cube_cache = {}          # z_index -> cube (current only)
         self._raw_cache = {}           # z_index -> (positions, raw_interferogram)
-        self.sel_px = None             # (row, col)
+        self.sel_pixels = []           # list of (row, col) clicked pixels
         self.recompute_on = False      # compute map from raw interferogram window
         self.proc = None               # HyperspectralProcessor (lazy)
 
@@ -532,13 +542,32 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
         # Interferogram / recompute tab
         igw = QtWidgets.QWidget(); ig = QtWidgets.QVBoxLayout(igw)
-        self.ifg_plot = pg.PlotWidget(title="Interferogram (ROI/frame mean) vs wedge position")
+        self.ifg_plot = pg.PlotWidget(
+            title="Interferogram vs wedge position (ROI/frame mean + clicked pixel)")
         self.ifg_plot.setLabel("bottom", "Wedge position", units="mm")
-        self.ifg_curve = self.ifg_plot.plot(pen=pg.mkPen("#1c7ed6", width=1))
+        self.ifg_plot.addLegend(offset=(-10, 10))
+        self.ifg_curve = self.ifg_plot.plot(pen=pg.mkPen("#1c7ed6", width=1),
+                                            name="ROI/frame mean")
+        # One interferogram curve per clicked pixel (raw[:, row, col]); rebuilt on
+        # each refresh from self.sel_pixels.
+        self.ifg_px_curves = []
         self.win_region = pg.LinearRegionItem(brush=(80, 160, 255, 45))
         self.win_region.sigRegionChangeFinished.connect(self._on_window_changed)
         self.ifg_plot.addItem(self.win_region)
         ig.addWidget(self.ifg_plot, 1)
+        # Which traces to show, and clear the pixel selection. Ctrl/Shift-click on
+        # the map adds pixels (plain click selects a single one).
+        vis = QtWidgets.QHBoxLayout()
+        vis.addWidget(QtWidgets.QLabel("Show:"))
+        self.chk_show_mean = QtWidgets.QCheckBox("ROI/frame mean"); self.chk_show_mean.setChecked(True)
+        self.chk_show_pixels = QtWidgets.QCheckBox("Pixels"); self.chk_show_pixels.setChecked(True)
+        self.chk_show_mean.toggled.connect(self.update_interferogram)
+        self.chk_show_pixels.toggled.connect(self.update_interferogram)
+        btn_clear_px = QtWidgets.QPushButton("Clear pixels")
+        btn_clear_px.clicked.connect(self._clear_pixels)
+        vis.addWidget(self.chk_show_mean); vis.addWidget(self.chk_show_pixels)
+        vis.addWidget(btn_clear_px); vis.addStretch(1)
+        ig.addLayout(vis)
         self.chk_recompute = QtWidgets.QCheckBox(
             "Recompute map/spectra from the interferogram window (below)")
         self.chk_recompute.toggled.connect(self._toggle_recompute)
@@ -909,6 +938,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         pos, raw = self.current_interferogram()
         if raw is None or pos is None:
             self.ifg_curve.setData([], [])
+            self._clear_pixel_curves()
             self.chk_recompute.setChecked(False)
             self.chk_recompute.setEnabled(False)
             self.lbl_axis.setText("")
@@ -928,12 +958,26 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             extra = "" if applied is None else "  (no cal file at acquisition)"
             self.lbl_axis.setText(f"Axis: raw measured — recompute applies current calibration{extra}")
             self.lbl_axis.setStyleSheet("font-weight:bold; color:#e8590c;")
-        if self.rois:
-            r0, r1, c0, c1 = self._roi_bounds(self.rois[0], raw.shape[1], raw.shape[2])
-            ifg = raw[:, r0:r1, c0:c1].mean(axis=(1, 2))
+        # ROI/frame mean trace (toggle with the "ROI/frame mean" checkbox).
+        if self.chk_show_mean.isChecked():
+            if self.rois:
+                r0, r1, c0, c1 = self._roi_bounds(self.rois[0], raw.shape[1], raw.shape[2])
+                ifg = raw[:, r0:r1, c0:c1].mean(axis=(1, 2))
+            else:
+                ifg = raw.mean(axis=(1, 2))
+            self.ifg_curve.setData(pos, ifg)
         else:
-            ifg = raw.mean(axis=(1, 2))
-        self.ifg_curve.setData(pos, ifg)
+            self.ifg_curve.setData([], [])
+        # One trace per clicked pixel (toggle with the "Pixels" checkbox), each
+        # coloured to match its spectrum in the Spectra tab.
+        self._clear_pixel_curves()
+        if self.chk_show_pixels.isChecked():
+            for i, (r, c) in enumerate(self.sel_pixels):
+                if 0 <= r < raw.shape[1] and 0 <= c < raw.shape[2]:
+                    cv = self.ifg_plot.plot(pos, raw[:, r, c],
+                                            pen=pg.mkPen(_pixel_color(i), width=1),
+                                            name=f"px({r},{c})")
+                    self.ifg_px_curves.append(cv)
         lo_b, hi_b = float(np.min(pos)), float(np.max(pos))
         self.win_region.setBounds([lo_b, hi_b])
         lo, hi = self.win_region.getRegion()
@@ -941,6 +985,18 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.win_region.blockSignals(True)
             self.win_region.setRegion([lo_b, hi_b])
             self.win_region.blockSignals(False)
+
+    def _clear_pixel_curves(self):
+        """Remove the per-pixel interferogram curves (and their legend entries)."""
+        for cv in getattr(self, "ifg_px_curves", []):
+            self.ifg_plot.removeItem(cv)
+        self.ifg_px_curves = []
+
+    def _clear_pixels(self):
+        """Drop all clicked-pixel selections and refresh the spectra + interferogram."""
+        self.sel_pixels = []
+        self.update_spectra()
+        self.update_interferogram()
 
     def _on_window_changed(self):
         lo, hi = self.win_region.getRegion()
@@ -1260,8 +1316,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         # fallbacks: ROI 1 / clicked pixel / whole-frame average
         if self.rois:
             return self._roi_spectrum(self.rois[0], cube)[0]
-        if self.sel_px is not None:
-            r, c = self.sel_px
+        if self.sel_pixels:
+            r, c = self.sel_pixels[0]
             _, h, w = cube.shape
             if 0 <= r < h and 0 <= c < w:
                 return cube[:, r, c]
@@ -1413,8 +1469,21 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         col, row = int(p.x()), int(p.y())
         _, h, w = cube.shape
         if 0 <= row < h and 0 <= col < w:
-            self.sel_px = (row, col)
+            px = (row, col)
+            # Ctrl/Shift-click adds (or toggles off) a pixel; a plain click selects
+            # just that one -- so you can overlay several pixels or reset to one.
+            mods = ev.modifiers()
+            add = bool(mods & (QtCore.Qt.KeyboardModifier.ControlModifier
+                               | QtCore.Qt.KeyboardModifier.ShiftModifier))
+            if add:
+                if px in self.sel_pixels:
+                    self.sel_pixels.remove(px)
+                else:
+                    self.sel_pixels.append(px)
+            else:
+                self.sel_pixels = [px]
             self.update_spectra()
+            self.update_interferogram()
 
     # -- ROIs -----------------------------------------------------------------
     def add_roi(self):
@@ -1589,15 +1658,23 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                                           brush=pg.mkBrush(*rgba), pen=pg.mkPen(None))
                 reg.setZValue(-10)
                 self.spec.addItem(reg)
-        # selected pixel spectrum
-        if self.sel_px is not None:
-            r, c = self.sel_px
-            _, h, w = cube.shape
+        # selected pixel spectra (one dashed trace per clicked pixel, coloured to
+        # match its interferogram in the Interferogram tab)
+        _, h, w = cube.shape
+        shown = []
+        for i, (r, c) in enumerate(self.sel_pixels):
             if 0 <= r < h and 0 <= c < w:
                 self.spec.plot(wl, self._post(cube[:, r, c]),
-                               pen=pg.mkPen("#868e96", width=1, style=QtCore.Qt.PenStyle.DashLine),
+                               pen=pg.mkPen(_pixel_color(i), width=1,
+                                            style=QtCore.Qt.PenStyle.DashLine),
                                name=f"px({r},{c})")
-                self.lbl_pixel.setText(f"Pixel (row {r}, col {c})")
+                shown.append(f"({r},{c})")
+        if shown:
+            self.lbl_pixel.setText("Pixels: " + ", ".join(shown)
+                                   + "   (Ctrl/Shift-click to add)")
+        else:
+            self.lbl_pixel.setText("Click the map for a pixel spectrum; "
+                                   "Ctrl/Shift-click to add more.")
         # keep the interferogram's ROI-mean curve in step with ROI 1
         if hasattr(self, "ifg_curve"):
             self.update_interferogram()
@@ -1810,9 +1887,10 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         cols = [self.wavelengths]; header = ["wavelength_um"]
         for i, roi in enumerate(self.rois):
             cols.append(self._post(self._roi_spectrum(roi, cube)[0])); header.append(f"ROI{i+1}")
-        if self.sel_px is not None:
-            r, c = self.sel_px
-            cols.append(self._post(cube[:, r, c])); header.append(f"px_{r}_{c}")
+        _, h, w = cube.shape
+        for r, c in self.sel_pixels:
+            if 0 <= r < h and 0 <= c < w:
+                cols.append(self._post(cube[:, r, c])); header.append(f"px_{r}_{c}")
         if len(cols) == 1:
             self.statusBar().showMessage("Nothing to export — add an ROI or click a pixel.")
             return
