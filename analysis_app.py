@@ -379,6 +379,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
         # right: tabs (Spectra / Process / Metadata)
         tabs = QtWidgets.QTabWidget()
+        self.tabs = tabs
         split.addWidget(tabs); split.setSizes([820, 500])
 
         # Spectra tab
@@ -546,11 +547,60 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ig.addWidget(self.lbl_win)
         tabs.addTab(igw, "Interferogram / Recompute")
 
+        # Phase tab: recompute the COMPLEX per-pixel DFT at the current λ / plane
+        # and show XY amplitude + wrapped phase side by side. The saved cube keeps
+        # only the DFT magnitude (np.abs), so the interferometric phase is lost;
+        # this re-runs the identical forward transform (same FT window as the
+        # Interferogram/Recompute tab + its apodization) and keeps the phase.
+        phw = QtWidgets.QWidget(); ph = QtWidgets.QVBoxLayout(phw)
+        self.phase_tab = phw
+        self._last_phase = None
+        self.ph_glw = pg.GraphicsLayoutWidget()
+        self.ph_glw.addLabel("Amplitude", row=0, col=0, colspan=2)
+        self.ph_glw.addLabel("Wrapped phase [-π, π]", row=0, col=2, colspan=2)
+        vb_a = self.ph_glw.addViewBox(row=1, col=0)
+        vb_a.setAspectLocked(True); vb_a.invertY(True)
+        self.ph_img_amp = pg.ImageItem(); vb_a.addItem(self.ph_img_amp)
+        self.ph_cbar_amp = pg.ColorBarItem(interactive=False, colorMap=_get_cmap("turbo"))
+        self.ph_glw.addItem(self.ph_cbar_amp, row=1, col=1)
+        self.ph_cbar_amp.setImageItem(self.ph_img_amp)
+        vb_p = self.ph_glw.addViewBox(row=1, col=2)
+        vb_p.setAspectLocked(True); vb_p.invertY(True)
+        vb_p.setBackgroundColor(pg.mkColor(200, 200, 200))
+        self.ph_img_phase = pg.ImageItem(); vb_p.addItem(self.ph_img_phase)
+        try:
+            _cyc = pg.colormap.get("CET-C1")           # cyclic map for wrapped phase
+        except Exception:  # noqa: BLE001
+            _cyc = _get_cmap("jet")
+        self.ph_cbar_phase = pg.ColorBarItem(interactive=False, colorMap=_cyc,
+                                             values=(-np.pi, np.pi))
+        self.ph_glw.addItem(self.ph_cbar_phase, row=1, col=3)
+        self.ph_cbar_phase.setImageItem(self.ph_img_phase)
+        ph.addWidget(self.ph_glw, 1)
+        pc = QtWidgets.QHBoxLayout()
+        pc.addWidget(QtWidgets.QLabel("Phase mask below"))
+        self.ph_thresh = QtWidgets.QDoubleSpinBox()
+        self.ph_thresh.setRange(0.0, 100.0); self.ph_thresh.setValue(5.0)
+        self.ph_thresh.setSuffix(" % max amp"); self.ph_thresh.setDecimals(2)
+        self.ph_thresh.valueChanged.connect(self._update_phase)
+        pc.addWidget(self.ph_thresh)
+        btn_ph_exp = QtWidgets.QPushButton("Export amp+phase…")
+        btn_ph_exp.clicked.connect(self._export_phase)
+        pc.addWidget(btn_ph_exp); pc.addStretch(1)
+        ph.addLayout(pc)
+        self.ph_info = QtWidgets.QLabel(
+            "Move the λ slider to change wavelength. The FT window + apodization "
+            "are taken from the Interferogram / Recompute tab.")
+        self.ph_info.setWordWrap(True); self.ph_info.setStyleSheet("color:#666;")
+        ph.addWidget(self.ph_info)
+        tabs.addTab(phw, "Phase")
+
         # Metadata tab
         self.meta = QtWidgets.QPlainTextEdit(); self.meta.setReadOnly(True)
         self.meta.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         tabs.addTab(self.meta, "Metadata")
 
+        tabs.currentChanged.connect(self._on_tab_changed)
         self.statusBar().showMessage("No data — File ▸ Load folder…")
 
     # -- loading --------------------------------------------------------------
@@ -637,6 +687,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.update_spectra()
             self.update_interferogram()
             self._update_meta()
+            self._update_phase()
             zr = (f"{self._z_axis[0]:.3f}…{self._z_axis[-1]:.3f} mm"
                   if len(self._z_axis) > 1 else
                   ("single Z" if self._z_axis[0] != self._z_axis[0]
@@ -685,6 +736,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.statusBar().showMessage("No cube acquired at this Z / angle combination.")
         self.refresh_map(); self.update_spectra()
         self.update_interferogram(); self._update_meta()
+        self._update_phase()
 
     # -- cube access (lazy, with denoise) ------------------------------------
     def _base_cube(self, zi):
@@ -820,6 +872,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._apply_wl_slider_range()
         self.refresh_map()
         self.update_spectra()
+        self._update_phase()
 
     def update_interferogram(self):
         if not self.infos:
@@ -869,6 +922,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         elif self.chk_recompute.isEnabled():
             self.statusBar().showMessage(
                 "Tick 'Recompute…' to apply this interferogram window.", 5000)
+        self._update_phase()   # phase always tracks the FT window
 
     def _toggle_recompute(self, on):
         self.recompute_on = bool(on)
@@ -877,8 +931,10 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._sync_wl_slider(len(self.wavelengths))
         self._cube_cache.clear()
         self.refresh_map(); self.update_spectra()
+        self._update_phase()
 
     def _recompute_if_on(self, *a):
+        self._update_phase()   # apodization also drives the phase view
         if self.recompute_on:
             self._cube_cache.clear()
             self.refresh_map(); self.update_spectra()
@@ -1000,6 +1056,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         cm = _get_cmap(self.combo_cmap.currentText())
         if cm is not None:
             self.iv.setColorMap(cm)
+        self._update_phase()
 
     def _show_rgb(self):
         """Render the false-colour RGB map in the left viewer (over the current
@@ -1228,6 +1285,87 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
     def _on_wl(self, *a):
         if self.combo_map.currentText() == "λ slice":
             self.refresh_map()
+        self._update_phase()
+
+    # -- phase view (complex DFT at one wavelength) ---------------------------
+    def _on_tab_changed(self, *a):
+        if (getattr(self, "phase_tab", None) is not None
+                and self.tabs.currentWidget() is self.phase_tab):
+            self._update_phase()
+
+    def _update_phase(self, *a):
+        """Recompute the complex per-pixel DFT at the current λ / plane and draw
+        the XY amplitude + wrapped-phase maps. Lazy: only runs while the Phase tab
+        is the visible tab (a full DFT per λ move is otherwise wasted)."""
+        if getattr(self, "phase_tab", None) is None:
+            return
+        if self.tabs.currentWidget() is not self.phase_tab:
+            return
+        if not self.infos or self.wavelengths is None:
+            return
+        pos, raw = self.current_interferogram()
+        if raw is None or pos is None:
+            self.ph_img_amp.clear(); self.ph_img_phase.clear()
+            self._last_phase = None
+            self.ph_info.setText("This file has no stored raw interferogram — "
+                                 "the phase view is unavailable (re-acquire with raw saved).")
+            return
+        idx = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
+        lam = float(np.asarray(self.wavelengths)[idx])
+        if self.proc is None:
+            self.proc = HyperspectralProcessor()
+        try:
+            cmap, info = self.proc.compute_complex_map(
+                pos, raw, lam, apod_type=self.r_apod.currentText(),
+                ft_window_mm=self.win_region.getRegion(),
+                expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
+                positions_calibrated=self.current_positions_calibrated())
+        except Exception as e:  # noqa: BLE001
+            self.ph_info.setText(f"Phase compute failed: {e}")
+            return
+        if cmap is None:
+            self.ph_info.setText("Too few scan positions for a DFT.")
+            return
+        amp = np.abs(cmap).astype(np.float32)
+        phase = np.angle(cmap).astype(np.float32)
+        amax = float(amp.max()) if amp.size else 0.0
+        hi = amax if amax > 0 else 1.0
+        thr = self.ph_thresh.value() / 100.0
+        ph_masked = phase.copy()
+        if amax > 0:
+            ph_masked[amp < thr * amax] = np.nan     # NaN -> transparent (grey bg)
+        cm_amp = _get_cmap(self.combo_cmap.currentText())
+        self.ph_img_amp.setImage(amp, autoLevels=False)
+        self.ph_cbar_amp.setColorMap(cm_amp)
+        self.ph_cbar_amp.setLevels((0.0, hi))
+        self.ph_img_phase.setImage(ph_masked, autoLevels=False, levels=(-np.pi, np.pi))
+        self._last_phase = (amp, phase)
+        axis_txt = ("calibrated axis (as-is)" if self.current_positions_calibrated()
+                    else "raw axis + motor cal")
+        lo_w, hi_w = self.win_region.getRegion()
+        self.ph_info.setText(
+            f"λ = {lam:.4f} µm   |   ZPD {info['center_mm']:.4f} mm   |   "
+            f"FT window {lo_w:.3f}–{hi_w:.3f} mm   |   apod {self.r_apod.currentText()}   |   "
+            f"{axis_txt}   |   phase masked below {self.ph_thresh.value():.3g}% of max amplitude")
+
+    def _export_phase(self):
+        lp = getattr(self, "_last_phase", None)
+        if lp is None:
+            self.statusBar().showMessage("No phase map yet — open the Phase tab first.", 4000)
+            return
+        amp, phase = lp
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export amplitude + phase", "phase_map.tsv",
+            "Tab-separated (*.tsv *.txt)")
+        if not path:
+            return
+        h, w = amp.shape
+        rows, cols = np.mgrid[0:h, 0:w]
+        data = np.column_stack([cols.ravel(), rows.ravel(),
+                                amp.ravel(), phase.ravel()])
+        np.savetxt(path, data, fmt="%.6g", delimiter="\t",
+                   header="col\trow\tamplitude\tphase_rad", comments="")
+        self.statusBar().showMessage(f"Saved {data.shape[0]} rows to {path}", 5000)
 
     def _on_click(self, ev):
         cube = self.current_cube()

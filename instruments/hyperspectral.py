@@ -378,3 +378,68 @@ class HyperspectralProcessor:
         # Magnitude/absorptive spectra don't need float64 -- float32 halves the
         # cube size in RAM and on disk with no meaningful precision loss.
         return wavelengths, spectrum_cube.astype(np.float32)
+
+    def compute_complex_map(self, positions, datacube, wavelength_um,
+                            apod_width=0.2, apod_type="gaussian",
+                            expected_zero_mm=None, search_mm=None,
+                            ft_window_mm=None, positions_calibrated=False):
+        """Per-pixel COMPLEX DFT at ONE wavelength -> (complex_map (h,w), info).
+
+        The saved spectrum cube keeps only the DFT magnitude (np.abs), throwing
+        the interferometric PHASE away. This runs the SAME forward transform as
+        compute_hyperspectral -- identical baseline removal, centre-burst (ZPD)
+        detection, apodization and FT window -- but for a single frequency and
+        WITHOUT taking the magnitude, so both the amplitude and the wrapped phase
+        map are available (thermal-hologram view).
+
+        `info` = {center_mm, freq, n_used}. Returns (None, {}) if too few points.
+        """
+        positions = np.asarray(positions, dtype=float)
+        datacube = np.asarray(datacube, dtype=float)
+        if datacube.ndim != 3 or datacube.shape[0] < 3:
+            return None, {}
+        n_pos, h, w = datacube.shape
+
+        # Motor-nonlinearity correction (unless the axis is already calibrated) --
+        # same rule as compute_hyperspectral, so the phase matches the saved cube.
+        if not positions_calibrated:
+            try:
+                from instruments.calibration import calibrate_position_axis
+                positions = np.asarray(calibrate_position_axis(positions), dtype=float)
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARN] KSpace phase: motor calibration skipped: {e}")
+
+        # Baseline removal (moving average) + signed-sum centre-burst.
+        from scipy.ndimage import uniform_filter1d
+        window = max(1, len(positions) // 5)
+        sig = datacube - uniform_filter1d(datacube, size=window, axis=0, mode='nearest')
+        center_idx = find_centerburst(np.sum(sig, axis=(1, 2)), positions,
+                                      expected_zero_mm, search_mm)
+
+        # Apodization (gaussian in position space, or a named FTIR window).
+        if str(apod_type).lower() == "gaussian":
+            sigma = abs(positions[-1] - positions[0]) * apod_width
+            apod = (np.exp(-(positions - positions[center_idx]) ** 2 / (2.0 * sigma ** 2))
+                    if sigma > 0 else np.ones(len(positions)))
+        else:
+            from instruments.dsp import apodization_window
+            apod = apodization_window(apod_type, len(positions), center_idx)
+
+        # FT window: keep the taper if the window contains the ZPD, else a boxcar
+        # (matches compute_hyperspectral's ft_window_mm branch).
+        if ft_window_mm is not None:
+            lo, hi = sorted(float(v) for v in ft_window_mm)
+            inwin = (positions >= lo) & (positions <= hi)
+            apod = (apod * inwin) if (lo <= positions[center_idx] <= hi) else inwin.astype(float)
+
+        # Single-frequency DFT for the requested wavelength.
+        freq = self._get_frequency_limits(wavelength_um, wavelength_um)[0]
+        dpos = np.diff(positions)
+        dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0.0)
+        weighted = sig * (dpos * apod)[:, np.newaxis, np.newaxis]
+        kernel = np.exp(-2j * np.pi * positions * freq)          # (n_pos,)
+        spec_flat = np.conj(kernel) @ weighted.reshape(n_pos, -1)  # (h*w,)
+        complex_map = spec_flat.reshape(h, w)
+        info = {"center_mm": float(positions[center_idx]), "freq": float(freq),
+                "n_used": int(np.count_nonzero(apod))}
+        return complex_map, info
