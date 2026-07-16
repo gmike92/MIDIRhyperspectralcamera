@@ -151,8 +151,12 @@ def _read_meta(path):
 
 
 class StokesApp(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, embedded=False):
         super().__init__()
+        # `embedded` = shown as a panel inside the analyzer, which already loaded a
+        # folder -> hide this panel's own "Load folder" button and instead get its
+        # files from the host via populate_from_paths().
+        self.embedded = embedded
         self.setWindowTitle("Stokes Polarimetry — hyperspectral QWP analyzer")
         self.resize(1300, 860)
         # Per-slot state: dict(cube, wl, name) or None; angles from the spin boxes.
@@ -181,12 +185,17 @@ class StokesApp(QtWidgets.QMainWindow):
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
         top.addWidget(self.method_combo)
         top.addSpacing(16)
-        btn_folder = QtWidgets.QPushButton("Load folder (auto-assign by angle)…")
-        btn_folder.clicked.connect(self._load_folder)
-        top.addWidget(btn_folder)
-        hint = QtWidgets.QLabel(
-            "reads each .npz's angle and fills I1..I4 at the selected formula's "
-            "angles; or load each slot by hand below")
+        if not self.embedded:
+            btn_folder = QtWidgets.QPushButton("Load folder (auto-assign by angle)…")
+            btn_folder.clicked.connect(self._load_folder)
+            top.addWidget(btn_folder)
+            hint = QtWidgets.QLabel(
+                "reads each .npz's angle and fills I1..I4 at the selected formula's "
+                "angles; or load each slot by hand below")
+        else:
+            hint = QtWidgets.QLabel(
+                "Auto-filled from the folder loaded in the analyzer (File ▸ Load "
+                "folder). Adjust individual slots below if needed.")
         hint.setStyleSheet("color:#888;")
         top.addWidget(hint)
         top.addSpacing(16)
@@ -394,12 +403,21 @@ class StokesApp(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, "No files", "No .npz files directly in that folder.")
             return
+        self.populate_from_paths(paths)
+
+    def populate_from_paths(self, paths):
+        """Auto-assign I1..I4 from a given list of .npz paths (used by the
+        standalone folder dialog AND by the analyzer to reuse its loaded folder).
+        Reads each file's angle/z, fills the QWP slots, and populates the
+        z-selector. No modal dialogs -- reports issues to the status bar."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
         metas = [(p, *_read_meta(p)) for p in paths]           # (path, angle, z)
         if not any(np.isfinite(a) for _, a, _ in metas):
-            QtWidgets.QMessageBox.warning(
-                self, "No angle metadata",
-                "None of these files store an angle (angle_value_deg). "
-                "Load the four measurements manually instead.")
+            self.status.showMessage(
+                "Loaded files carry no angle (angle_value_deg) — cannot auto-assign "
+                "QWP slots. Load the four measurements manually below.")
             return
         self._folder_metas = metas
         # Populate the in-window z-position selector (a z-stack -> several z).

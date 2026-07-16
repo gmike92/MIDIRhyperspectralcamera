@@ -337,6 +337,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.recompute_on = False      # compute map from raw interferogram window
         self.proc = None               # HyperspectralProcessor (lazy)
         self.phase_mode = False        # True while the phase-only page is shown
+        self._stokes_dirty = True      # Stokes panel needs (re)fill from loaded folder
 
         self._build_ui()
 
@@ -721,7 +722,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.stack.addWidget(self.phase_page)   # index 1
         # Stokes page: embed the standalone StokesApp (its own self-contained UI
         # + file loading), so the panel behaves exactly like stokes_app.py.
-        self.stokes_app = StokesApp() if StokesApp is not None else None
+        self.stokes_app = StokesApp(embedded=True) if StokesApp is not None else None
         if self.stokes_app is not None:
             self.stack.addWidget(self.stokes_app)   # index 2
         self.setCentralWidget(self.stack)
@@ -821,6 +822,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             if len(self._a_axis) > 1:
                 zr += f", {len(self._a_axis)} angles {self._a_axis[0]:.1f}…{self._a_axis[-1]:.1f}°"
             self.statusBar().showMessage(f"Loaded {len(infos)} cube(s): {zr}")
+            # A new dataset -> the Stokes panel must refill from it (lazily on next
+            # open, or right away if it is the page currently shown).
+            self._stokes_dirty = True
+            if (self.stokes_app is not None
+                    and self.stack.currentWidget() is self.stokes_app):
+                self._refresh_stokes_from_main()
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -1459,10 +1466,26 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     def _toggle_stokes_view(self, on):
         """Show the embedded Stokes polarimetry page. Mutually exclusive with the
-        Phase view."""
+        Phase view. On entry, (re)fill it from the folder loaded in the analyzer
+        so the user does not pick a folder again."""
         if on:
             self.act_phase.setChecked(False)
+            if self._stokes_dirty:
+                self._refresh_stokes_from_main()
         self._show_view()
+
+    def _refresh_stokes_from_main(self):
+        """Feed the Stokes panel the .npz files currently loaded in the analyzer
+        (File ▸ Load folder), so it auto-assigns the four QWP slots by angle."""
+        if self.stokes_app is None:
+            return
+        if not self.infos:
+            self.stokes_app.status.showMessage(
+                "No dataset loaded — use File ▸ Load folder in the analyzer first.")
+            return
+        paths = list(dict.fromkeys(i["path"] for i in self.infos))   # unique, ordered
+        self.stokes_app.populate_from_paths(paths)
+        self._stokes_dirty = False
 
     def _show_view(self):
         """Pick the central page from the two view toggles (else the main view)."""
