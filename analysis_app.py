@@ -40,6 +40,14 @@ from instruments import analysis as A
 from instruments.hyperspectral import (
     HyperspectralProcessor, resolve_n_points, DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM)
 
+# Stokes polarimetry panel (embedded as a toolbar-toggled page). Guarded so the
+# analyzer still starts if stokes_app.py is ever absent -- the Stokes button is
+# just omitted in that case.
+try:
+    from stokes_app import StokesApp
+except Exception:  # noqa: BLE001
+    StokesApp = None
+
 
 # ---------------------------------------------------------------------------
 # File helpers (read metadata cheaply; load cube on demand)
@@ -347,6 +355,15 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.act_phase.setToolTip("Show only the amplitude + wrapped-phase maps "
                                   "(recomputed complex DFT at the current λ).")
         self.act_phase.toggled.connect(self._toggle_phase_view)
+        # Stokes polarimetry panel (same functionality as stokes_app.py), shown as
+        # its own toolbar-toggled page. Mutually exclusive with the Phase view.
+        self.act_stokes = None
+        if StokesApp is not None:
+            self.act_stokes = tb.addAction("Stokes")
+            self.act_stokes.setCheckable(True)
+            self.act_stokes.setToolTip("Stokes polarimetry: load four QWP-angle "
+                                       "measurements and compute S0..S3 per pixel.")
+            self.act_stokes.toggled.connect(self._toggle_stokes_view)
         tb.addSeparator()
         tb.addAction("Save image…").triggered.connect(self.export_image)
         tb.addAction("Export GIF…").triggered.connect(self.export_gif)
@@ -702,6 +719,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.main_split)   # index 0
         self.stack.addWidget(self.phase_page)   # index 1
+        # Stokes page: embed the standalone StokesApp (its own self-contained UI
+        # + file loading), so the panel behaves exactly like stokes_app.py.
+        self.stokes_app = StokesApp() if StokesApp is not None else None
+        if self.stokes_app is not None:
+            self.stack.addWidget(self.stokes_app)   # index 2
         self.setCentralWidget(self.stack)
 
         self.statusBar().showMessage("No data — File ▸ Load folder…")
@@ -1425,13 +1447,31 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         pass
 
     def _toggle_phase_view(self, on):
-        """Switch the central stack between the normal view and the phase-only
-        page (amplitude + wrapped phase). Recompute the phase on entry."""
+        """Show the phase-only page (amplitude + wrapped phase). Mutually exclusive
+        with the Stokes view."""
+        if on and self.act_stokes is not None:
+            self.act_stokes.setChecked(False)   # only one alternate view at a time
         self.phase_mode = bool(on)
-        self.stack.setCurrentWidget(self.phase_page if on else self.main_split)
+        self._show_view()
         if on:
             self._mirror_phase_sliders()
             self._update_phase()
+
+    def _toggle_stokes_view(self, on):
+        """Show the embedded Stokes polarimetry page. Mutually exclusive with the
+        Phase view."""
+        if on:
+            self.act_phase.setChecked(False)
+        self._show_view()
+
+    def _show_view(self):
+        """Pick the central page from the two view toggles (else the main view)."""
+        if self.act_phase.isChecked():
+            self.stack.setCurrentWidget(self.phase_page)
+        elif self.act_stokes is not None and self.act_stokes.isChecked():
+            self.stack.setCurrentWidget(self.stokes_app)
+        else:
+            self.stack.setCurrentWidget(self.main_split)
 
     def _mirror_phase_sliders(self):
         """Copy the master sliders' ranges/values/visibility onto the phase-page
