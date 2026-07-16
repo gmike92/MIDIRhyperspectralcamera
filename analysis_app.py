@@ -328,6 +328,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.sel_pixels = []           # list of (row, col) clicked pixels
         self.recompute_on = False      # compute map from raw interferogram window
         self.proc = None               # HyperspectralProcessor (lazy)
+        self.phase_mode = False        # True while the phase-only page is shown
 
         self._build_ui()
 
@@ -338,6 +339,15 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         tb.addAction("Load folder…").triggered.connect(self.load_folder)
         tb.addAction("Load files…").triggered.connect(self.load_files)
         tb.addSeparator()
+        # "Phase" toggle: switches the whole view to a focused page showing only
+        # the amplitude + wrapped-phase maps (recomputed complex DFT). Off = the
+        # normal analysis view.
+        self.act_phase = tb.addAction("Phase")
+        self.act_phase.setCheckable(True)
+        self.act_phase.setToolTip("Show only the amplitude + wrapped-phase maps "
+                                  "(recomputed complex DFT at the current λ).")
+        self.act_phase.toggled.connect(self._toggle_phase_view)
+        tb.addSeparator()
         tb.addAction("Save image…").triggered.connect(self.export_image)
         tb.addAction("Export GIF…").triggered.connect(self.export_gif)
         tb.addAction("Export spectra…").triggered.connect(self.export_spectra)
@@ -346,7 +356,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         tb.addAction("Recompute → save all Z…").triggered.connect(self.batch_recompute)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        self.setCentralWidget(split)
+        self.main_split = split   # page 0 of the central stack (built at the end)
 
         # left: image + sliders + display controls
         leftw = QtWidgets.QWidget(); left = QtWidgets.QVBoxLayout(leftw)
@@ -608,9 +618,34 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         # only the DFT magnitude (np.abs), so the interferometric phase is lost;
         # this re-runs the identical forward transform (same FT window as the
         # Interferogram/Recompute tab + its apodization) and keeps the phase.
-        phw = QtWidgets.QWidget(); ph = QtWidgets.QVBoxLayout(phw)
-        self.phase_tab = phw
+        self.phase_page = QtWidgets.QWidget(); ph = QtWidgets.QVBoxLayout(self.phase_page)
         self._last_phase = None
+        # Slim slider bar so the phase-only page is self-contained: λ (+ z / angle
+        # when present) mirror the main sliders both ways (see _mirror_phase_sliders).
+        pbar = QtWidgets.QHBoxLayout()
+        self.ph_wl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.ph_lbl_wl = QtWidgets.QLabel("-- µm"); self.ph_lbl_wl.setStyleSheet("font-weight:600;")
+        pbar.addWidget(QtWidgets.QLabel("λ:")); pbar.addWidget(self.ph_wl, 1); pbar.addWidget(self.ph_lbl_wl)
+        self.ph_z = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.ph_lbl_z = QtWidgets.QLabel("--")
+        self.ph_zrow = QtWidgets.QWidget(); _pz = QtWidgets.QHBoxLayout(self.ph_zrow); _pz.setContentsMargins(0,0,0,0)
+        _pz.addWidget(QtWidgets.QLabel("Z:")); _pz.addWidget(self.ph_z, 1); _pz.addWidget(self.ph_lbl_z)
+        self.ph_a = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.ph_lbl_a = QtWidgets.QLabel("--")
+        self.ph_arow = QtWidgets.QWidget(); _pa = QtWidgets.QHBoxLayout(self.ph_arow); _pa.setContentsMargins(0,0,0,0)
+        _pa.addWidget(QtWidgets.QLabel("Angle:")); _pa.addWidget(self.ph_a, 1); _pa.addWidget(self.ph_lbl_a)
+        self.ph_zrow.setVisible(False); self.ph_arow.setVisible(False)
+        pbar.addWidget(self.ph_zrow, 1); pbar.addWidget(self.ph_arow, 1)
+        ph.addLayout(pbar)
+        # Two-way mirror: moving a phase slider drives the master (which updates the
+        # maps); moving the master mirrors back. setValue only re-emits on a real
+        # change, so the two converge with no feedback loop.
+        self.ph_wl.valueChanged.connect(self.wl_slider.setValue)
+        self.ph_z.valueChanged.connect(self.z_slider.setValue)
+        self.ph_a.valueChanged.connect(self.angle_slider.setValue)
+        self.wl_slider.valueChanged.connect(self.ph_wl.setValue)
+        self.z_slider.valueChanged.connect(self.ph_z.setValue)
+        self.angle_slider.valueChanged.connect(self.ph_a.setValue)
         self.ph_glw = pg.GraphicsLayoutWidget()
         self.ph_glw.addLabel("Amplitude", row=0, col=0, colspan=2)
         self.ph_glw.addLabel("Wrapped phase [-π, π]", row=0, col=2, colspan=2)
@@ -651,7 +686,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             "are taken from the Interferogram / Recompute tab.")
         self.ph_info.setWordWrap(True); self.ph_info.setStyleSheet("color:#666;")
         ph.addWidget(self.ph_info)
-        tabs.addTab(phw, "Phase")
+        # (phase_page is NOT a tab -- it is page 1 of the central stack, shown via
+        # the "Phase" toolbar toggle.)
 
         # Metadata tab
         self.meta = QtWidgets.QPlainTextEdit(); self.meta.setReadOnly(True)
@@ -659,6 +695,15 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         tabs.addTab(self.meta, "Metadata")
 
         tabs.currentChanged.connect(self._on_tab_changed)
+
+        # Central stack: page 0 = normal analysis view, page 1 = phase-only page
+        # (just the amplitude + wrapped-phase maps). The "Phase" toolbar toggle
+        # switches between them.
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self.main_split)   # index 0
+        self.stack.addWidget(self.phase_page)   # index 1
+        self.setCentralWidget(self.stack)
+
         self.statusBar().showMessage("No data — File ▸ Load folder…")
 
     # -- loading --------------------------------------------------------------
@@ -745,6 +790,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.update_spectra()
             self.update_interferogram()
             self._update_meta()
+            self._mirror_phase_sliders()   # phase-page sliders track the new data
             self._update_phase()
             zr = (f"{self._z_axis[0]:.3f}…{self._z_axis[-1]:.3f} mm"
                   if len(self._z_axis) > 1 else
@@ -1374,9 +1420,33 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     # -- phase view (complex DFT at one wavelength) ---------------------------
     def _on_tab_changed(self, *a):
-        if (getattr(self, "phase_tab", None) is not None
-                and self.tabs.currentWidget() is self.phase_tab):
+        # Phase is no longer a tab (it is the toolbar-toggled stack page); nothing
+        # to do here, kept so the currentChanged connection stays valid.
+        pass
+
+    def _toggle_phase_view(self, on):
+        """Switch the central stack between the normal view and the phase-only
+        page (amplitude + wrapped phase). Recompute the phase on entry."""
+        self.phase_mode = bool(on)
+        self.stack.setCurrentWidget(self.phase_page if on else self.main_split)
+        if on:
+            self._mirror_phase_sliders()
             self._update_phase()
+
+    def _mirror_phase_sliders(self):
+        """Copy the master sliders' ranges/values/visibility onto the phase-page
+        sliders (signals blocked so it never fights the two-way connections)."""
+        for src, dst in ((self.wl_slider, self.ph_wl), (self.z_slider, self.ph_z),
+                         (self.angle_slider, self.ph_a)):
+            dst.blockSignals(True)
+            dst.setMinimum(src.minimum()); dst.setMaximum(src.maximum())
+            dst.setValue(src.value())
+            dst.blockSignals(False)
+        self.ph_zrow.setVisible(self.zrow.isVisible())
+        self.ph_arow.setVisible(self.arow.isVisible())
+        self.ph_lbl_wl.setText(self.lbl_wl.text())
+        self.ph_lbl_z.setText(self.lbl_z.text())
+        self.ph_lbl_a.setText(self.lbl_a.text())
 
     def _on_phase_cmap(self, *a):
         """Recolor the wrapped-phase map (colormap only -- no DFT recompute)."""
@@ -1386,12 +1456,15 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     def _update_phase(self, *a):
         """Recompute the complex per-pixel DFT at the current λ / plane and draw
-        the XY amplitude + wrapped-phase maps. Lazy: only runs while the Phase tab
-        is the visible tab (a full DFT per λ move is otherwise wasted)."""
-        if getattr(self, "phase_tab", None) is None:
+        the XY amplitude + wrapped-phase maps. Lazy: only runs while the phase-only
+        page is shown (a full DFT per λ move is otherwise wasted)."""
+        if not getattr(self, "phase_mode", False):
             return
-        if self.tabs.currentWidget() is not self.phase_tab:
-            return
+        # Keep the phase-page slider labels in step with the master view.
+        self.ph_lbl_z.setText(self.lbl_z.text()); self.ph_lbl_a.setText(self.lbl_a.text())
+        if self.wavelengths is not None and len(self.wavelengths):
+            _i = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
+            self.ph_lbl_wl.setText(f"{float(np.asarray(self.wavelengths)[_i]):.3f} µm")
         if not self.infos or self.wavelengths is None:
             return
         pos, raw = self.current_interferogram()
