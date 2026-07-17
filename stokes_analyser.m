@@ -12,14 +12,21 @@ function stokes_analyser()
 % measurement frame = filename QWP angle - 45 deg.
 %
 % Features:
-%   * Formula selector -- two methods, each with its own 4 angles + Stokes eqns.
+%   * Formula selector -- THREE methods:
+%       A,B) two 4-angle closed-form sets (frame = filename angle - 45), and
+%       Fitting) least-squares of I(theta)=A+B*sin2t+C*cos4t+D*sin4t over ALL
+%       loaded angles (theta = filename angle, NO -45), then S0=A-C, S1=2C,
+%       S2=2D, S3=B. The fitting method uses a variable number of measurements.
 %   * Load folder (auto-assign by angle): reads each file's angle/z metadata and
-%     fills I1..I4 at the method's target angles; a z-position dropdown lets you
-%     switch z within a z-stack. Or load each slot by hand (filename shown).
+%     fills I1..I4 at the method's target angles (or uses every angle for the
+%     fit); a z-position dropdown lets you switch z within a z-stack. Or load
+%     each slot by hand (filename shown).
 %   * Wavelength averaging range + optional FLAT-FIELD correction (divide by the
 %     frame at a chosen lambda). When on, Stokes use the corrected intensities.
 %   * S1..S3 on a diverging blue-white-red map with adjustable colour limits;
 %     S0 and the intensities on viridis.
+%   * Export the Stokes and/or intensity maps as .mat (raw arrays + metadata),
+%     .png/.tiff/.jpg (one rendered image per map) or .fig.
 %
 % Reads acquisition_app .npz directly (no Python). Place anywhere and run:
 %     stokes_analyser
@@ -35,14 +42,25 @@ titlesB = {'S_0 = I_1 + I_4', ...
            'S_1 = 2 (I_2 + I_3 - I_1 - I_4) / S_0', ...
            'S_2 = [(I_1 - I_4)\surd2 - 2 I_2 + 2 I_3] / S_0', ...
            'S_3 = (I_1 - I_4) / S_0'};
-methods_(1).name    = '0, 45, 67.5, 90  ->  frame -45, 0, 22.5, 45';
+titlesFit = {'S_0 = A - C', 'S_1 = 2C', 'S_2 = 2D', 'S_3 = B'};
+methods_(1).name    = '4-angle set A: 0, 45, 67.5, 90  ->  frame -45, 0, 22.5, 45';
 methods_(1).fangles = [0 45 67.5 90];
 methods_(1).titles  = titlesA;
 methods_(1).fn      = @stokesA;
-methods_(2).name    = '0, 22.5, 67.5, 90  ->  frame -45, -22.5, 22.5, 45';
+methods_(1).is_fit  = false;
+methods_(2).name    = '4-angle set B: 0, 22.5, 67.5, 90  ->  frame -45, -22.5, 22.5, 45';
 methods_(2).fangles = [0 22.5 67.5 90];
 methods_(2).titles  = titlesB;
 methods_(2).fn      = @stokesB;
+methods_(2).is_fit  = false;
+% Fitting method: least-squares fit of I(θ)=A+B·sin2θ+C·cos4θ+D·sin4θ over ALL
+% loaded angles (θ = filename angle, NO -45 offset), then S0=A-C, S1=2C,
+% S2=2D, S3=B. Uses a variable number of measurements from the loaded folder.
+methods_(3).name    = 'Fitting (all angles): I=A+B·sin2θ+C·cos4θ+D·sin4θ, no -45';
+methods_(3).fangles = [];
+methods_(3).titles  = titlesFit;
+methods_(3).fn      = [];
+methods_(3).is_fit  = true;
 
 VIR = viridisMap();
 BWR = bwrMap();
@@ -54,6 +72,8 @@ Icell    = cell(1, 4);      % raw averaged intensity images
 Ibkgcell = cell(1, 4);      % flat-field-corrected intensity images
 Scell    = cell(1, 4);      % Stokes maps
 metaPaths = {}; metaAngle = []; metaZ = [];   % last scanned folder
+fit_cache = containers.Map('KeyType', 'char', 'ValueType', 'any');  % path -> cube/wl
+fit_angles = [];                              % angles used by the last fit
 ranges_init = false;
 first_stokes = true;
 syncing = false;
@@ -73,9 +93,9 @@ G = uigridlayout(fig, [5, 1]);
 G.RowHeight = {38, 96, 38, '1x', 24};
 G.Padding = [8 8 8 8]; G.RowSpacing = 6;
 
-% Row 1: formula + folder + z
-c1 = uigridlayout(G, [1, 6]);
-c1.Layout.Row = 1; c1.ColumnWidth = {55, 320, 210, 75, 130, '1x'};
+% Row 1: formula + folder + z + export
+c1 = uigridlayout(G, [1, 8]);
+c1.Layout.Row = 1; c1.ColumnWidth = {55, 300, 200, 70, 110, '1x', 160, 90};
 c1.Padding = [0 0 0 0];
 uilabel(c1, 'Text', 'Formula:');
 method_dd = uidropdown(c1, 'Items', {methods_.name}, 'ItemsData', 1:numel(methods_), ...
@@ -87,6 +107,9 @@ z_dd = uidropdown(c1, 'Items', {'—'}, 'ItemsData', [], 'Enable', 'off', ...
     'ValueChangedFcn', @(s,e) onZChanged());
 uilabel(c1, 'Text', 'reads each .npz angle to fill I1..I4; or load slots by hand', ...
     'FontColor', [.5 .5 .5]);
+exp_what = uidropdown(c1, 'Items', {'Both', 'Stokes S0-S3', 'Intensities I1-I4'}, ...
+    'Value', 'Both');
+uibutton(c1, 'Text', 'Export…', 'ButtonPushedFcn', @(s,e) doExport());
 
 % Row 2: four slot loaders
 srow = uigridlayout(G, [1, 4]); srow.Layout.Row = 2; srow.Padding = [0 0 0 0];
@@ -173,7 +196,14 @@ for ii = 1:4, angle_fields(ii).Value = fr0(ii); end
         mth = methods_(method_dd.Value);
         for kk = 1:4, title(axS(kk), mth.titles{kk}); end
         first_stokes = true;                       % re-autoscale for the new formula
-        if ~isempty(metaPaths)
+        if mth.is_fit
+            if isempty(metaPaths)
+                status_lbl.Text = 'Fitting: load a folder of angle measurements (Load folder).';
+            else
+                fit_cache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+                recomputeFit();
+            end
+        elseif ~isempty(metaPaths)
             assignFromFolder(currentZ());
         else
             fra = frameAngles();
@@ -244,11 +274,17 @@ for ii = 1:4, angle_fields(ii).Value = fr0(ii); end
         zs = unique(round(metaZ(~isnan(metaZ)), 4));
         if isempty(zs)
             z_dd.Items = {'—'}; z_dd.ItemsData = []; z_dd.Enable = 'off';
-            assignFromFolder(NaN);
         else
             items = arrayfun(@(z) sprintf('%.4f mm', z), zs, 'UniformOutput', false);
             z_dd.Items = items; z_dd.ItemsData = zs; z_dd.Value = zs(1);
             if numel(zs) > 1, z_dd.Enable = 'on'; else, z_dd.Enable = 'off'; end
+        end
+        fit_cache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+        if methods_(method_dd.Value).is_fit
+            recomputeFit();
+        elseif isempty(zs)
+            assignFromFolder(NaN);
+        else
             assignFromFolder(zs(1));
         end
     end
@@ -259,7 +295,12 @@ for ii = 1:4, angle_fields(ii).Value = fr0(ii); end
 
     function onZChanged()
         if isempty(metaPaths), return; end
-        assignFromFolder(currentZ());
+        if methods_(method_dd.Value).is_fit
+            fit_cache = containers.Map('KeyType', 'char', 'ValueType', 'any');  % z changed
+            recomputeFit();
+        else
+            assignFromFolder(currentZ());
+        end
     end
 
     function assignFromFolder(zsel)
@@ -291,6 +332,11 @@ for ii = 1:4, angle_fields(ii).Value = fr0(ii); end
 
     % ------------------------------------------------------------- compute
     function recompute()
+        if methods_(method_dd.Value).is_fit
+            recomputeFit();
+            return;
+        end
+        fit_angles = [];
         if ~all([slots.loaded])
             status_lbl.Text = sprintf('Loaded %d/4 measurements — load all four to compute Stokes.', ...
                 sum([slots.loaded]));
@@ -352,6 +398,97 @@ for ii = 1:4, angle_fields(ii).Value = fr0(ii); end
         first_stokes = false;
     end
 
+    % ------------------------------------------------- fitting method
+    function recomputeFit()
+        fit_angles = [];
+        if isempty(metaPaths)
+            status_lbl.Text = 'Fitting: load a folder of angle measurements (Load folder).';
+            return;
+        end
+        zz = currentZ();
+        mask = ~isnan(metaAngle);
+        if ~isnan(zz), mask = mask & (abs(metaZ - zz) < 1e-3); end
+        idxs = find(mask);
+        if numel(idxs) < 4
+            status_lbl.Text = sprintf('Fitting needs at least 4 angles; found %d at this z.', numel(idxs));
+            return;
+        end
+        [angs, ord] = sort(metaAngle(idxs)); idxs = idxs(ord);
+        fpaths = metaPaths(idxs);
+        wl0 = sp_wl0.Value; wl1 = sp_wl1.Value; wlb = sp_wlbkg.Value;
+        N = numel(idxs);
+        Ith = cell(1, N); H = 0; W = 0;
+        for n = 1:N
+            [cubn, wln] = getFitCube(fpaths{n});
+            [~, a] = min(abs(wln - wl0)); [~, b] = min(abs(wln - wl1));
+            lo = min(a, b); hi = max(a, b);
+            Iavg = double(squeeze(mean(cubn(lo:hi, :, :), 1)));
+            if chk_ff.Value
+                [~, ib] = min(abs(wln - wlb));
+                Iavg = Iavg ./ double(squeeze(cubn(ib, :, :)));
+            end
+            if n == 1
+                [H, W] = size(Iavg);
+            elseif ~isequal(size(Iavg), [H W])
+                status_lbl.Text = 'Fitting: measurements have different image sizes.'; return;
+            end
+            Ith{n} = Iavg;
+        end
+        % Per-pixel least-squares of I(theta) = A + B sin2t + C cos4t + D sin4t.
+        % theta = the filename angles (no -45), in RADIANS for sin/cos.
+        theta = deg2rad(angs(:));
+        X = [ones(N, 1), sin(2*theta), cos(4*theta), sin(4*theta)];   % N x 4
+        Imat = zeros(N, H*W);
+        for n = 1:N, Imat(n, :) = reshape(Ith{n}, 1, []); end
+        coeff = X \ Imat;                       % 4 x (H*W)
+        Ac = reshape(coeff(1, :), H, W);
+        Bc = reshape(coeff(2, :), H, W);
+        Cc = reshape(coeff(3, :), H, W);
+        Dc = reshape(coeff(4, :), H, W);
+        S0 = Ac - Cc; S1 = 2*Cc; S2 = 2*Dc; S3 = Bc;
+        Scell = {S0, S1, S2, S3};
+        for q = 1:4, mp = Scell{q}; mp(~isfinite(mp)) = NaN; Scell{q} = mp; end
+        Icell = cell(1, 4); Ibkgcell = cell(1, 4);
+        for q = 1:4
+            if q <= N, Icell{q} = Ith{q}; Ibkgcell{q} = Ith{q}; end
+        end
+        fit_angles = theta.';
+        updateIntensitiesFit(Ith, angs);
+        updateStokes();
+        extra = ''; if N > 4, extra = sprintf('  (showing 4 of %d)', N); end
+        status_lbl.Text = sprintf(['Fit over %d angles [%s]° | λ %.4f–%.4f µm | ', ...
+            'flat-field %s | S0=A−C, S1=2C, S2=2D, S3=B%s'], ...
+            N, strtrim(sprintf('%g ', angs)), wl0, wl1, ...
+            ternary(chk_ff.Value, 'ON', 'off'), extra);
+    end
+
+    function [fcube, fwl] = getFitCube(fpath)
+        if isKey(fit_cache, fpath)
+            e = fit_cache(fpath); fcube = e.cube; fwl = e.wl;
+        else
+            [fcube, fwl, ~] = loadMeasurement(fpath);
+            fit_cache(fpath) = struct('cube', fcube, 'wl', fwl);
+        end
+    end
+
+    function updateIntensitiesFit(Imaps, thetas)
+        n = numel(Imaps);
+        for q = 1:4
+            if q <= n
+                d = Imaps{q};
+                imI(q).CData = d; setImgLimits(axI(q), d);
+                [lo, hi] = finiteRange(d); clim(axI(q), [lo, hi]);
+                ttl = sprintf('I(θ = %g°)', thetas(q));
+                if chk_ff.Value, ttl = [ttl, '  (flat-fielded)']; end
+                title(axI(q), ttl, 'Interpreter', 'none');
+            else
+                imI(q).CData = zeros(2); setImgLimits(axI(q), zeros(2));
+                clim(axI(q), [0 1]);
+                title(axI(q), '(unused in display)', 'Interpreter', 'none');
+            end
+        end
+    end
+
     % ----------------------------------------------------- colour limits
     function autoClim(k)
         d = Scell{k}; fin = d(isfinite(d));
@@ -376,6 +513,70 @@ for ii = 1:4, angle_fields(ii).Value = fr0(ii); end
         lo = s_min(k).Value; hi = s_max(k).Value;
         if hi > lo, clim(axS(k), [lo, hi]); end
     end
+
+    % ------------------------------------------------------------- export
+    function doExport()
+        if ~all([slots.loaded]) || isempty(Scell) || isempty(Scell{1})
+            uialert(fig, 'Load all four measurements first (nothing computed yet).', ...
+                'Nothing to export');
+            return;
+        end
+        esel = exp_what.Value;
+        doI = ~strcmp(esel, 'Stokes S0-S3');          % intensities unless Stokes-only
+        doS = ~strcmp(esel, 'Intensities I1-I4');     % Stokes unless intensities-only
+        % Collect the CURRENTLY DISPLAYED maps (image, colormap, limits, title)
+        % into a plain struct array to hand to the (local) export helpers.
+        D = struct('data', {}, 'cmap', {}, 'lims', {}, 'ttl', {}, 'interp', {}, 'name', {});
+        if doI
+            for q = 1:4
+                D(end+1) = struct('data', imI(q).CData, 'cmap', axI(q).Colormap, ...
+                    'lims', axI(q).CLim, 'ttl', axI(q).Title.String, ...
+                    'interp', 'none', 'name', sprintf('I%d', q)); %#ok<AGROW>
+            end
+        end
+        if doS
+            for q = 1:4
+                D(end+1) = struct('data', imS(q).CData, 'cmap', axS(q).Colormap, ...
+                    'lims', axS(q).CLim, 'ttl', axS(q).Title.String, ...
+                    'interp', 'tex', 'name', sprintf('S%d', q-1)); %#ok<AGROW>
+            end
+        end
+        meta = struct();
+        meta.method = methods_(method_dd.Value).name;
+        meta.frame_angles_deg = arrayfun(@(h) h.Value, angle_fields);
+        if ~isempty(fit_angles), meta.fit_angles_deg = fit_angles; end
+        meta.filenames = {slots.name};
+        meta.wl_from_um = sp_wl0.Value; meta.wl_to_um = sp_wl1.Value;
+        meta.flatfield = logical(chk_ff.Value); meta.wl_bkg_um = sp_wlbkg.Value;
+
+        filters = {'*.mat', 'MATLAB data (*.mat)'; ...
+                   '*.png', 'PNG image (*.png)'; ...
+                   '*.tif', 'TIFF image (*.tif)'; ...
+                   '*.jpg', 'JPEG image (*.jpg)'; ...
+                   '*.fig', 'MATLAB figure (*.fig)'};
+        [ef, ep] = uiputfile(filters, 'Export Stokes / intensities', ...
+            fullfile(last_dir, 'stokes_export'));
+        if isequal(ef, 0), return; end
+        last_dir = ep;
+        [~, estem, eext] = fileparts(ef);
+        outpath = fullfile(ep, ef);
+        try
+            switch lower(eext)
+                case '.mat'
+                    exportMatFile(outpath, meta, doI, doS, Icell, Ibkgcell, Scell);
+                case {'.png', '.tif', '.tiff', '.jpg', '.jpeg'}
+                    exportImageFiles(fullfile(ep, estem), lower(eext(2:end)), D);
+                    outpath = fullfile(ep, [estem '_*' eext]);
+                case '.fig'
+                    exportFigFile(outpath, D);
+                otherwise
+                    uialert(fig, sprintf('Unsupported format: %s', eext), 'Export'); return;
+            end
+        catch ME
+            uialert(fig, ME.message, 'Export failed'); return;
+        end
+        status_lbl.Text = sprintf('Exported %d map(s) -> %s', numel(D), outpath);
+    end
 end
 
 % ======================================================================
@@ -395,6 +596,64 @@ S0 = I1 + I4;
 S1 = (2*I2 + 2*I3 - 2*I1 - 2*I4) ./ S0;
 S2 = ((I1 - I4)*sqrt(2) - 2*I2 + 2*I3) ./ S0;
 S3 = (I1 - I4) ./ S0;
+end
+
+% ======================================================================
+%                    EXPORT (.mat / image / .fig)
+% ======================================================================
+function exportMatFile(matPath, meta, doI, doS, Icell, Ibkgcell, Scell)
+% Save the raw numeric maps + metadata (each becomes a top-level variable).
+out = struct();
+out.meta = meta;
+if doI
+    out.I1 = Icell{1}; out.I2 = Icell{2}; out.I3 = Icell{3}; out.I4 = Icell{4};
+    if meta.flatfield        % also store the flat-field-corrected intensities
+        out.I1_ff = Ibkgcell{1}; out.I2_ff = Ibkgcell{2};
+        out.I3_ff = Ibkgcell{3}; out.I4_ff = Ibkgcell{4};
+    end
+end
+if doS
+    out.S0 = Scell{1}; out.S1 = Scell{2}; out.S2 = Scell{3}; out.S3 = Scell{4};
+end
+save(matPath, '-struct', 'out');
+end
+
+function exportImageFiles(stemPath, imExt, D)
+% One rendered image per map: <stem>_<name>.<ext> (with colorbar + title).
+for i = 1:numel(D)
+    file = sprintf('%s_%s.%s', stemPath, D(i).name, imExt);
+    renderMapToFile(D(i), file);
+end
+end
+
+function exportFigFile(figPath, D)
+% One editable .fig with all selected maps as tiles.
+tf = figure('Color', 'w', 'Name', 'Stokes / intensities export', 'Visible', 'off');
+tl = tiledlayout(tf, 'flow', 'Padding', 'compact', 'TileSpacing', 'compact');
+for i = 1:numel(D)
+    drawMap(nexttile(tl), D(i));
+end
+savefig(tf, figPath);
+close(tf);
+end
+
+function renderMapToFile(item, file)
+tf = figure('Color', 'w', 'Visible', 'off', 'Position', [100, 100, 560, 480]);
+cleaner = onCleanup(@() close(tf)); %#ok<NASGU>
+drawMap(axes(tf), item);
+exportgraphics(tf, file, 'Resolution', 200);
+end
+
+function drawMap(ax, item)
+im = imagesc(ax, item.data);
+axis(ax, 'image'); ax.YDir = 'reverse';
+im.AlphaData = ~isnan(item.data);       % NaN (masked) -> transparent
+colormap(ax, item.cmap);
+if numel(item.lims) == 2 && item.lims(2) > item.lims(1)
+    clim(ax, item.lims);
+end
+colorbar(ax);
+title(ax, item.ttl, 'Interpreter', item.interp);
 end
 
 % ======================================================================
