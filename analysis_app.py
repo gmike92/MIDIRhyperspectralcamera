@@ -343,35 +343,55 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     # -- UI -------------------------------------------------------------------
     def _build_ui(self):
-        # toolbar
+        # toolbar: exactly six controls -- Load folder | Load files | [view
+        # selector: Hypercube · Phase · Stokes] | Save/Export dropdown.
         tb = self.addToolBar("File")
+        tb.setMovable(False)
         tb.addAction("Load folder…").triggered.connect(self.load_folder)
         tb.addAction("Load files…").triggered.connect(self.load_files)
         tb.addSeparator()
-        # "Phase" toggle: switches the whole view to a focused page showing only
-        # the amplitude + wrapped-phase maps (recomputed complex DFT). Off = the
-        # normal analysis view.
+
+        # View selector: three mutually-exclusive toggles picking the central page.
+        # Exactly one is always active, so "Hypercube" is the always-available way
+        # back from the Phase / Stokes views.
+        self.view_group = QtGui.QActionGroup(self)
+        self.view_group.setExclusive(True)
+        self.act_hyper = tb.addAction("Hypercube")
+        self.act_hyper.setCheckable(True)
+        self.act_hyper.setChecked(True)                 # default view (before connect)
+        self.act_hyper.setToolTip("Main hypercube view: spatial map, spectra, "
+                                  "process and metadata.")
+        self.act_hyper.toggled.connect(self._toggle_hyper_view)
+        self.view_group.addAction(self.act_hyper)
         self.act_phase = tb.addAction("Phase")
         self.act_phase.setCheckable(True)
         self.act_phase.setToolTip("Show only the amplitude + wrapped-phase maps "
                                   "(recomputed complex DFT at the current λ).")
         self.act_phase.toggled.connect(self._toggle_phase_view)
-        # Stokes polarimetry panel (same functionality as stokes_app.py), shown as
-        # its own toolbar-toggled page. Mutually exclusive with the Phase view.
+        self.view_group.addAction(self.act_phase)
         self.act_stokes = None
         if StokesApp is not None:
             self.act_stokes = tb.addAction("Stokes")
             self.act_stokes.setCheckable(True)
-            self.act_stokes.setToolTip("Stokes polarimetry: load four QWP-angle "
-                                       "measurements and compute S0..S3 per pixel.")
+            self.act_stokes.setToolTip("Stokes polarimetry: compute S0..S3 per "
+                                       "pixel from four QWP-angle measurements.")
             self.act_stokes.toggled.connect(self._toggle_stokes_view)
+            self.view_group.addAction(self.act_stokes)
         tb.addSeparator()
-        tb.addAction("Save image…").triggered.connect(self.export_image)
-        tb.addAction("Export GIF…").triggered.connect(self.export_gif)
-        tb.addAction("Export spectra…").triggered.connect(self.export_spectra)
-        tb.addAction("Export ROI vs Z…").triggered.connect(self.export_roi_vs_z)
-        tb.addSeparator()
-        tb.addAction("Recompute → save all Z…").triggered.connect(self.batch_recompute)
+
+        # Save / Export dropdown: all saving + export actions in one menu button.
+        save_btn = QtWidgets.QToolButton()
+        save_btn.setText("Save / Export ▾")
+        save_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        save_menu = QtWidgets.QMenu(save_btn)
+        save_menu.addAction("Save image…").triggered.connect(self.export_image)
+        save_menu.addAction("Export GIF…").triggered.connect(self.export_gif)
+        save_menu.addAction("Export spectra…").triggered.connect(self.export_spectra)
+        save_menu.addAction("Export ROI vs Z…").triggered.connect(self.export_roi_vs_z)
+        save_menu.addSeparator()
+        save_menu.addAction("Recompute → save all Z…").triggered.connect(self.batch_recompute)
+        save_btn.setMenu(save_menu)
+        tb.addWidget(save_btn)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.main_split = split   # page 0 of the central stack (built at the end)
@@ -1453,11 +1473,16 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         # to do here, kept so the currentChanged connection stays valid.
         pass
 
+    # The three view toggles share an exclusive QActionGroup, so exactly one is
+    # active; switching one off fires when another is switched on. Each handler
+    # just re-derives the page from the current checked states via _show_view.
+    def _toggle_hyper_view(self, on):
+        """Back to the main hypercube view."""
+        if on:
+            self._show_view()
+
     def _toggle_phase_view(self, on):
-        """Show the phase-only page (amplitude + wrapped phase). Mutually exclusive
-        with the Stokes view."""
-        if on and self.act_stokes is not None:
-            self.act_stokes.setChecked(False)   # only one alternate view at a time
+        """Show the phase-only page (amplitude + wrapped phase)."""
         self.phase_mode = bool(on)
         self._show_view()
         if on:
@@ -1465,13 +1490,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._update_phase()
 
     def _toggle_stokes_view(self, on):
-        """Show the embedded Stokes polarimetry page. Mutually exclusive with the
-        Phase view. On entry, (re)fill it from the folder loaded in the analyzer
-        so the user does not pick a folder again."""
-        if on:
-            self.act_phase.setChecked(False)
-            if self._stokes_dirty:
-                self._refresh_stokes_from_main()
+        """Show the embedded Stokes polarimetry page. On entry, (re)fill it from
+        the folder loaded in the analyzer so the user does not pick a folder
+        again."""
+        if on and self._stokes_dirty:
+            self._refresh_stokes_from_main()
         self._show_view()
 
     def _refresh_stokes_from_main(self):
@@ -1488,7 +1511,9 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._stokes_dirty = False
 
     def _show_view(self):
-        """Pick the central page from the two view toggles (else the main view)."""
+        """Pick the central page from the view toggles (Hypercube = main view)."""
+        if getattr(self, "stack", None) is None:
+            return                                  # toolbar built before the stack
         if self.act_phase.isChecked():
             self.stack.setCurrentWidget(self.phase_page)
         elif self.act_stokes is not None and self.act_stokes.isChecked():
