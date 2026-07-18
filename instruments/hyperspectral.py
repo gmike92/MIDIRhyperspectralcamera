@@ -382,7 +382,8 @@ class HyperspectralProcessor:
     def compute_complex_map(self, positions, datacube, wavelength_um,
                             apod_width=0.2, apod_type="gaussian",
                             expected_zero_mm=None, search_mm=None,
-                            ft_window_mm=None, positions_calibrated=False):
+                            ft_window_mm=None, positions_calibrated=False,
+                            reference_cube=None):
         """Per-pixel COMPLEX DFT at ONE wavelength -> (complex_map (h,w), info).
 
         The saved spectrum cube keeps only the DFT magnitude (np.abs), throwing
@@ -392,13 +393,24 @@ class HyperspectralProcessor:
         WITHOUT taking the magnitude, so both the amplitude and the wrapped phase
         map are available (thermal-hologram view).
 
-        `info` = {center_mm, freq, n_used}. Returns (None, {}) if too few points.
+        `reference_cube` (a background interferogram of the same shape): the
+        per-pixel BACKGROUND phase is subtracted (complex_map *= exp(-i*angle(ref)))
+        to remove the interferometer's instrumental phase, leaving the true
+        spectral phase -- the same reference phase-correction compute_hyperspectral
+        does. The reference defines the ZPD centre (both use it).
+
+        `info` = {center_mm, freq, n_used, phase_corrected}. (None, {}) if too few.
         """
         positions = np.asarray(positions, dtype=float)
         datacube = np.asarray(datacube, dtype=float)
         if datacube.ndim != 3 or datacube.shape[0] < 3:
             return None, {}
         n_pos, h, w = datacube.shape
+        ref = None
+        if reference_cube is not None:
+            ref = np.asarray(reference_cube, dtype=float)
+            if ref.shape != datacube.shape:
+                ref = None            # incompatible -> ignore, no phase correction
 
         # Motor-nonlinearity correction (unless the axis is already calibrated) --
         # same rule as compute_hyperspectral, so the phase matches the saved cube.
@@ -409,11 +421,15 @@ class HyperspectralProcessor:
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] KSpace phase: motor calibration skipped: {e}")
 
-        # Baseline removal (moving average) + signed-sum centre-burst.
+        # Baseline removal (moving average) + signed-sum centre-burst. When a
+        # reference is given it DEFINES the ZPD centre (both cubes share it).
         from scipy.ndimage import uniform_filter1d
         window = max(1, len(positions) // 5)
         sig = datacube - uniform_filter1d(datacube, size=window, axis=0, mode='nearest')
-        center_idx = find_centerburst(np.sum(sig, axis=(1, 2)), positions,
+        ref_sig = (ref - uniform_filter1d(ref, size=window, axis=0, mode='nearest')
+                   if ref is not None else None)
+        burst_src = ref_sig if ref_sig is not None else sig
+        center_idx = find_centerburst(np.sum(burst_src, axis=(1, 2)), positions,
                                       expected_zero_mm, search_mm)
 
         # Apodization (gaussian in position space, or a named FTIR window).
@@ -436,10 +452,14 @@ class HyperspectralProcessor:
         freq = self._get_frequency_limits(wavelength_um, wavelength_um)[0]
         dpos = np.diff(positions)
         dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0.0)
-        weighted = sig * (dpos * apod)[:, np.newaxis, np.newaxis]
+        wkernel = (dpos * apod)[:, np.newaxis, np.newaxis]
         kernel = np.exp(-2j * np.pi * positions * freq)          # (n_pos,)
-        spec_flat = np.conj(kernel) @ weighted.reshape(n_pos, -1)  # (h*w,)
+        spec_flat = np.conj(kernel) @ (sig * wkernel).reshape(n_pos, -1)  # (h*w,)
         complex_map = spec_flat.reshape(h, w)
+        if ref_sig is not None:
+            ref_spec = np.conj(kernel) @ (ref_sig * wkernel).reshape(n_pos, -1)
+            complex_map = complex_map * np.exp(-1j * np.angle(ref_spec.reshape(h, w)))
         info = {"center_mm": float(positions[center_idx]), "freq": float(freq),
-                "n_used": int(np.count_nonzero(apod))}
+                "n_used": int(np.count_nonzero(apod)),
+                "phase_corrected": ref_sig is not None}
         return complex_map, info
