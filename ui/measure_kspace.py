@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from datetime import datetime
 
@@ -24,9 +25,28 @@ import pyqtgraph as pg
 from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout,
-    QWidget,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
+
+# Disk-space guards for saving hypercubes (large files).
+LOW_DISK_WARN_GB = 3.0     # warn once when free space drops below this during a scan
+LOW_DISK_ABORT_GB = 0.5    # abort the scan to avoid failed / truncated saves
+
+
+def _free_gb(path):
+    """Free space (GB) on the volume that holds `path`, walking up to the nearest
+    existing directory. Returns None if it can't be determined."""
+    try:
+        p = os.path.abspath(path)
+        while p and not os.path.isdir(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        return shutil.disk_usage(p or ".").free / 1e9
+    except Exception:  # noqa: BLE001
+        return None
 
 from instruments.subtwinslv import TwinsScanner
 from instruments.hyperspectral import (
@@ -472,6 +492,7 @@ class MeasurePanel(QWidget):
     sig_status = QtCore.pyqtSignal(str)
     sig_done = QtCore.pyqtSignal(object, object, object, object)  # wl, cubes, z, sat_masks
     sig_point = QtCore.pyqtSignal(float, float, bool)  # pos, ROI-mean, is_first_of_scan
+    sig_warn = QtCore.pyqtSignal(str, str)  # (title, message) -> modal warning on the GUI thread
 
     def __init__(self, stages_panel, frame_source, roi_provider,
                  roi_show=None, bg_provider=None, save_dir_provider=None,
@@ -489,6 +510,7 @@ class MeasurePanel(QWidget):
         self.background_map = None             # binned-ROI background saved with the cube
         self.background_subtracted = False
         self._abort = False
+        self._low_disk_warned = False
         self.viewer = None
         self.wavelengths = None
         self.cubes = []
@@ -541,6 +563,7 @@ class MeasurePanel(QWidget):
         self.sig_status.connect(self._on_status)
         self.sig_done.connect(self._on_done)
         self.sig_point.connect(self._on_point)
+        self.sig_warn.connect(self._on_warn)
         # The master scan checkboxes drive the (Z × angle) grid-size readout.
         self.chk_zscan.toggled.connect(self._update_grid_label)
         self.chk_ascan.toggled.connect(self._update_grid_label)
@@ -1187,6 +1210,37 @@ class MeasurePanel(QWidget):
         # named <run-timestamp>.<filename> under the camera folder.
         camera_folder = (self.save_dir_provider() if self.save_dir_provider
                          else None) or self.save_dir
+        # --- Disk-space check: estimate the data size and warn if the save volume
+        # is low (do this BEFORE freezing the UI / starting the thread). ---
+        frame = self.frame_source()
+        if roi is not None:
+            hh, ww = roi[1] - roi[0], roi[3] - roi[2]
+        elif frame is not None:
+            hh, ww = int(frame.shape[0]), int(frame.shape[1])
+        else:
+            hh = ww = 0
+        binf = max(1, params["bin"])
+        hb, wb = max(1, hh // binf), max(1, ww // binf)
+        n_freq_est = resolve_n_points(params["n"], manual=params["nfreq"])
+        grid_total = ((len(z_targets) if zscan else 1) * (len(a_targets) if ascan else 1))
+        # per cube = raw (n_pos planes) + spectrum (n_freq planes), float32. Files
+        # are saved UNCOMPRESSED, so this matches actual on-disk size closely.
+        est_gb = grid_total * (params["n"] + n_freq_est) * hb * wb * 4 / 1e9
+        free_gb = _free_gb(camera_folder)
+        if free_gb is not None and (free_gb < est_gb * 1.1 or free_gb < LOW_DISK_ABORT_GB):
+            drive = os.path.splitdrive(os.path.abspath(camera_folder))[0] or camera_folder
+            ans = QMessageBox.warning(
+                self, "Low disk space",
+                f"This acquisition needs roughly {est_gb:.1f} GB, but only "
+                f"{free_gb:.1f} GB is free on {drive}\\.\n\nData may fail to save "
+                f"mid-scan. Proceed anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                self.sig_status.emit(
+                    f"acquisition cancelled -- only {free_gb:.1f} GB free (need ~{est_gb:.1f} GB)")
+                return
+        self._low_disk_warned = False   # mid-scan low-disk warning fires once per run
         self._save_fname = self.edit_filename.text().strip() or "kspace"
         self._run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_folder = os.path.join(camera_folder, f"{self._run_stamp}.{self._save_fname}")
@@ -1314,16 +1368,21 @@ class MeasurePanel(QWidget):
             return raw, info
 
     def _save_position_npz(self, wl, cube, sat_mask, z_value, z_index,
-                           datacube=None, positions=None, compress=True,
+                           datacube=None, positions=None, compress=False,
                            a_value=None, a_index=None) -> str:
         """Save ONE stage position to its own .npz in the run folder.
 
         Called twice per position in a Z-scan: first in the ACQUIRE phase with
-        cube=None / compress=False -- a fast raw-interferogram-only safety save so
-        no acquired step is ever lost -- then in the TRANSFORM phase with the
-        computed spectrum (compressed), OVERWRITING the same file. The path is
-        deterministic in (run stamp, filename, z) so the second call upgrades the
-        first. Thread-safe (uses values snapshotted in _start, no GUI access)."""
+        cube=None -- a fast raw-interferogram-only safety save so no acquired step
+        is ever lost -- then in the TRANSFORM phase with the computed spectrum,
+        OVERWRITING the same file. The path is deterministic in (run stamp,
+        filename, z) so the second call upgrades the first. Thread-safe (uses
+        values snapshotted in _start, no GUI access).
+
+        Saved UNCOMPRESSED by default (compress=False): the spectrum cube barely
+        compresses (~0.9) yet zlib DEFLATE dominates the per-position wall-clock
+        (~90 s vs ~2 s to write). Disk headroom is guarded by the low-disk checks
+        in _start / the acquire loop instead."""
         folder = getattr(self, "_save_folder", None) or self.save_dir
         fname = getattr(self, "_save_fname", None) or "kspace"
         os.makedirs(folder, exist_ok=True)
@@ -1472,6 +1531,24 @@ class MeasurePanel(QWidget):
                     acquired.append({"z": z, "zi": zi, "a": a, "ai": ai, "gi": g,
                                      "positions": np.asarray(positions),
                                      "datacube": np.asarray(datacube)})
+                    # Disk-space guard: warn once when low, ABORT before the volume
+                    # fills so we don't write corrupt / truncated files.
+                    free = _free_gb(self._save_folder)
+                    if free is not None and free < LOW_DISK_ABORT_GB:
+                        self.sig_warn.emit(
+                            "Disk full — acquisition stopped",
+                            f"Only {free:.2f} GB free on the save drive. Stopping to "
+                            f"avoid corrupt saves. {g} of {total} points were acquired.")
+                        self.sig_status.emit(f"ABORTED: disk full ({free:.2f} GB free)")
+                        self._abort = True
+                        break
+                    if (free is not None and free < LOW_DISK_WARN_GB
+                            and not self._low_disk_warned):
+                        self._low_disk_warned = True
+                        self.sig_warn.emit(
+                            "Low disk space",
+                            f"Only {free:.1f} GB free on the save drive — free up space "
+                            f"or this acquisition may fail to finish saving.")
                     # Safety save: write THIS grid point's raw interferogram
                     # immediately (uncompressed = fast), so a later crash never
                     # loses acquired data. Phase 2 overwrites it with the spectrum.
@@ -1558,6 +1635,11 @@ class MeasurePanel(QWidget):
                 self.progress.setValue(cur)
             except Exception:  # noqa: BLE001
                 pass
+
+    @QtCore.pyqtSlot(str, str)
+    def _on_warn(self, title: str, message: str) -> None:
+        """Modal warning raised from the scan thread (via sig_warn)."""
+        QMessageBox.warning(self, title, message)
 
     @QtCore.pyqtSlot(object, object, object, object)
     def _on_done(self, wavelengths, cubes, z_values, sat_masks) -> None:
@@ -1711,7 +1793,7 @@ class MeasurePanel(QWidget):
                     [self._position_calibration(p)[0] for p in self.raw_positions])
             except Exception:  # noqa: BLE001 (ragged per-z shapes -> skip raw)
                 pass
-        np.savez_compressed(stem + ".npz", **kw)
+        np.savez(stem + ".npz", **kw)  # uncompressed: fast write, cube barely compresses
         return stem + ".npz"
 
     def _save(self) -> None:

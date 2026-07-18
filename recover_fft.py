@@ -43,7 +43,7 @@ def recover_file(path, dest_dir, proc):
 
         # already processed -> copy through unchanged
         if "spectrum_cube" in files:
-            np.savez_compressed(out, **{k: d[k] for k in files})
+            np.savez(out, **{k: d[k] for k in files})
             return "copied (already complete)"
         if "raw_interferogram" not in files:
             return "skipped (no raw interferogram)"
@@ -110,7 +110,7 @@ def recover_file(path, dest_dir, proc):
     if background is not None:
         kw["background"] = background
         kw["background_subtracted"] = bool(bg_sub)
-    np.savez_compressed(out, **kw)
+    np.savez(out, **kw)  # uncompressed: fast write; cube barely compresses
     return f"FFT -> {cube.shape} ({n_freq} bins)"
 
 
