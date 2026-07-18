@@ -351,6 +351,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.phase_bkg = None          # (ref_raw_cube, ref_positions, path) background
         self.phase_bkg_on = False      # subtract the background phase (per-pixel)
         self._stokes_dirty = True      # Stokes panel needs (re)fill from loaded folder
+        self.work_roi = None           # pg.RectROI defining the analysis crop (or None)
+        self._full_hw = None           # (h, w) of the FULL current frame (pre-crop)
 
         # Debounce: slider drags fire valueChanged rapidly; coalesce the heavy
         # refresh (cube reload + map/spectra/DFT) so only the settled value runs.
@@ -465,6 +467,23 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ctl.addWidget(QtWidgets.QLabel("Colors:")); ctl.addWidget(self.combo_cmap, 1)
         ctl.addWidget(QtWidgets.QLabel("γ:")); ctl.addWidget(self.spin_gamma)
         left.addLayout(ctl)
+
+        # Analysis ROI: crop EVERY panel (map, spectra, clicked pixels, phase,
+        # raw-recompute) to a rectangle so nothing outside it is ever computed.
+        # Uncheck to see the full frame + drag the box; check to crop to it.
+        wrow = QtWidgets.QHBoxLayout()
+        self.chk_work = QtWidgets.QCheckBox("Limit to ROI")
+        self.chk_work.setToolTip("Crop every panel to the ROI box so out-of-interest "
+                                 "regions are never recomputed. Uncheck to reposition it.")
+        self.chk_work.toggled.connect(self._on_work_toggled)
+        self.btn_work_reset = QtWidgets.QPushButton("Reset box")
+        self.btn_work_reset.setToolTip("Recentre the analysis-ROI box on the full frame.")
+        self.btn_work_reset.clicked.connect(self._reset_work_roi)
+        self.lbl_work = QtWidgets.QLabel("full frame")
+        self.lbl_work.setStyleSheet("color:#888;")
+        wrow.addWidget(self.chk_work); wrow.addWidget(self.btn_work_reset)
+        wrow.addWidget(self.lbl_work, 1)
+        left.addLayout(wrow)
 
         # Intensity scale (the colour scalebar is the histogram beside the image;
         # these lock it to a fixed min/max so it stays constant while scrubbing).
@@ -687,10 +706,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.ph_wl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.ph_lbl_wl = QtWidgets.QLabel("-- µm"); self.ph_lbl_wl.setStyleSheet("font-weight:600;")
         pbar.addWidget(QtWidgets.QLabel("λ:")); pbar.addWidget(self.ph_wl, 1); pbar.addWidget(self.ph_lbl_wl)
-        self.ph_z = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.ph_lbl_z = QtWidgets.QLabel("--")
+        # Z as a dropdown of the actual positions (like the Stokes panel), rather
+        # than a slider -- lists each z in mm and jumps straight to it.
+        self.ph_z_combo = QtWidgets.QComboBox(); self.ph_z_combo.setMinimumWidth(110)
         self.ph_zrow = QtWidgets.QWidget(); _pz = QtWidgets.QHBoxLayout(self.ph_zrow); _pz.setContentsMargins(0,0,0,0)
-        _pz.addWidget(QtWidgets.QLabel("Z:")); _pz.addWidget(self.ph_z, 1); _pz.addWidget(self.ph_lbl_z)
+        _pz.addWidget(QtWidgets.QLabel("Z:")); _pz.addWidget(self.ph_z_combo, 1)
         self.ph_a = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.ph_lbl_a = QtWidgets.QLabel("--")
         self.ph_arow = QtWidgets.QWidget(); _pa = QtWidgets.QHBoxLayout(self.ph_arow); _pa.setContentsMargins(0,0,0,0)
@@ -702,11 +722,13 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         # maps); moving the master mirrors back. setValue only re-emits on a real
         # change, so the two converge with no feedback loop.
         self.ph_wl.valueChanged.connect(self.wl_slider.setValue)
-        self.ph_z.valueChanged.connect(self.z_slider.setValue)
         self.ph_a.valueChanged.connect(self.angle_slider.setValue)
         self.wl_slider.valueChanged.connect(self.ph_wl.setValue)
-        self.z_slider.valueChanged.connect(self.ph_z.setValue)
         self.angle_slider.valueChanged.connect(self.ph_a.setValue)
+        # Z dropdown <-> master z slider (index == z position). setCurrentIndex /
+        # setValue only re-emit on a real change, so the two converge, no loop.
+        self.ph_z_combo.currentIndexChanged.connect(self._on_ph_z_combo)
+        self.z_slider.valueChanged.connect(self.ph_z_combo.setCurrentIndex)
         self.ph_glw = pg.GraphicsLayoutWidget()
         self.ph_glw.addLabel("Amplitude", row=0, col=0, colspan=2)
         self.ph_glw.addLabel("Wrapped phase [-π, π]", row=0, col=2, colspan=2)
@@ -852,6 +874,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._saved_wavelengths = self.wavelengths
             self._cube_cache.clear(); self._raw_cache.clear()
             self._kmeans_labels = None; self._cluster_key = None
+            self._reset_work_crop()        # new dataset -> back to full frame
             self.recompute_on = False
             self.chk_recompute.blockSignals(True)
             self.chk_recompute.setChecked(False); self.chk_recompute.setEnabled(True)
@@ -928,6 +951,119 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.lbl_z.setText("--" if z != z else f"{z:.4f} mm")
         self.lbl_a.setText("--" if a != a else f"{a:.2f}°")
 
+    # -- analysis ROI (crop every panel to a region of interest) --------------
+    def _work_active(self):
+        return self.chk_work.isChecked() and self.work_roi is not None
+
+    def _work_bounds(self, h, w):
+        """(r0,r1,c0,c1) crop of a full (h,w) frame from the analysis ROI box,
+        clipped to the frame; None when the crop is off / degenerate."""
+        if not self._work_active():
+            return None
+        pos, size = self.work_roi.pos(), self.work_roi.size()
+        c0 = int(np.clip(round(float(pos[0])), 0, w - 1))
+        r0 = int(np.clip(round(float(pos[1])), 0, h - 1))
+        c1 = int(np.clip(round(float(pos[0]) + float(size[0])), c0 + 1, w))
+        r1 = int(np.clip(round(float(pos[1]) + float(size[1])), r0 + 1, h))
+        return (r0, r1, c0, c1) if (r1 > r0 and c1 > c0) else None
+
+    def _work_crop3(self, arr):
+        """Crop a FULL (n,h,w) array to the analysis ROI (identity if crop off)."""
+        if arr is None or arr.ndim != 3:
+            return arr
+        b = self._work_bounds(arr.shape[1], arr.shape[2])
+        if b is None:
+            return arr
+        r0, r1, c0, c1 = b
+        return arr[:, r0:r1, c0:c1]
+
+    def _ensure_work_roi(self, h, w):
+        if self.work_roi is not None:
+            return
+        sw, sh = max(2, int(w * 0.6)), max(2, int(h * 0.6))
+        roi = pg.RectROI([(w - sw) // 2, (h - sh) // 2], [sw, sh],
+                         pen=pg.mkPen("#ffd43b", width=2))
+        roi.setZValue(20)
+        roi.sigRegionChanged.connect(self._update_work_label)
+        self.iv.getView().addItem(roi)
+        roi.setVisible(False)
+        self.work_roi = roi
+
+    def _update_work_label(self, *a):
+        b = self._work_bounds(*self._full_hw) if (self._work_active() and self._full_hw) else None
+        if b:
+            r0, r1, c0, c1 = b
+            self.lbl_work.setText(f"ROI {c1-c0}×{r1-r0} px @ ({c0},{r0})")
+        elif self.work_roi is not None and not self.chk_work.isChecked():
+            pos, size = self.work_roi.pos(), self.work_roi.size()
+            self.lbl_work.setText(f"box {int(size[0])}×{int(size[1])} px "
+                                  f"(check 'Limit to ROI' to apply)")
+        else:
+            self.lbl_work.setText("full frame")
+
+    def _clear_rois_silent(self):
+        """Drop all measurement ROIs + their references without recursing into a
+        refresh (coordinates change when the crop toggles)."""
+        for roi in self.rois:
+            try:
+                self.iv.getView().removeItem(roi)
+            except Exception:  # noqa: BLE001
+                pass
+        self.rois = []
+        self.ref_roi = self.bg_roi = self.sam_ref_roi = None
+        self._bg_sig = None
+        if hasattr(self, "lbl_bg"):
+            self.lbl_bg.setText("Background: none")
+
+    def _on_work_toggled(self, on):
+        """Enter/leave the ROI-cropped view. Coordinates change, so cached cubes
+        and measurement ROIs/pixels are reset."""
+        if on:
+            if not self._full_hw:
+                self.chk_work.blockSignals(True); self.chk_work.setChecked(False)
+                self.chk_work.blockSignals(False)
+                self.statusBar().showMessage("Load a dataset first.")
+                return
+            self._ensure_work_roi(*self._full_hw)
+            self.work_roi.setVisible(False)        # cropped view -> hide the box
+        elif self.work_roi is not None:
+            self.work_roi.setVisible(True)         # full frame -> box for repositioning
+        # region changed -> invalidate cube-shaped caches + local (per-frame) state
+        self._cube_cache.clear(); self._bg_cube = None; self._bg_sig = None
+        self.sel_pixels = []
+        self._clear_rois_silent()
+        self._kmeans_labels = None; self._cluster_key = None
+        self._update_work_label()
+        self.refresh_map(); self.update_spectra()
+        self.update_interferogram(); self._update_meta(); self._update_phase()
+
+    def _reset_work_crop(self):
+        """New dataset -> discard the analysis ROI (its dims may differ) and return
+        to the full frame."""
+        self.chk_work.blockSignals(True); self.chk_work.setChecked(False)
+        self.chk_work.blockSignals(False)
+        if self.work_roi is not None:
+            try:
+                self.iv.getView().removeItem(self.work_roi)
+            except Exception:  # noqa: BLE001
+                pass
+            self.work_roi = None
+        self._full_hw = None
+        if hasattr(self, "lbl_work"):
+            self.lbl_work.setText("full frame")
+
+    def _reset_work_roi(self):
+        if not self._full_hw:
+            return
+        h, w = self._full_hw
+        self._ensure_work_roi(h, w)
+        sw, sh = max(2, int(w * 0.6)), max(2, int(h * 0.6))
+        self.work_roi.setSize([sw, sh]); self.work_roi.setPos([(w - sw) // 2, (h - sh) // 2])
+        self.work_roi.setVisible(not self.chk_work.isChecked())
+        if self.chk_work.isChecked():
+            self._on_work_toggled(True)            # re-crop to the recentred box
+        self._update_work_label()
+
     def _on_selection_changed(self, *a):
         """Z or angle slider moved. Update the label instantly and DEBOUNCE the
         heavy refresh (a fresh cube reload) so dragging across a stack only loads
@@ -977,8 +1113,16 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
             try:
                 wl, cube = self._base_cube(zi)
-                if cube is not None and self.chk_svd.isChecked():
-                    cube = A.svd_denoise(cube, self.spin_k.value())
+                if cube is not None:
+                    # Analysis ROI: crop the loaded FULL cube. (When recompute_on,
+                    # _base_cube already returns a cube computed from the cropped
+                    # raw, so it must NOT be cropped again -- hence the guard. Full
+                    # dims are tracked from the full cube / full raw for the ROI.)
+                    if not self.recompute_on:
+                        self._full_hw = cube.shape[1:]
+                        cube = self._work_crop3(cube)
+                    if self.chk_svd.isChecked():
+                        cube = A.svd_denoise(cube, self.spin_k.value())
                 # Cache the cube WITH its own wavelength axis so they never drift
                 # apart (files can differ in n_freq; recompute changes the axis).
                 self._cube_cache[zi] = (np.asarray(wl) if wl is not None else None, cube)
@@ -1023,7 +1167,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._raw_cache[zi] = (pos, raw, calibrated)
             self._trim_cache(self._raw_cache)
         pos, raw, _ = self._raw_cache[zi]
-        return pos, raw
+        # The cache holds the FULL raw; track full dims and return the analysis-ROI
+        # crop so phase / recompute only work on the region of interest.
+        if raw is not None:
+            self._full_hw = raw.shape[1:]
+        return pos, self._work_crop3(raw)
 
     def current_positions_calibrated(self):
         """True if the current z's position axis is already the calibrated one
@@ -1036,7 +1184,9 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         is loaded, phasing is enabled, and its shape matches (else None)."""
         if not self.phase_bkg_on or self.phase_bkg is None:
             return None
-        ref_raw = self.phase_bkg[0]
+        # Crop the (full-frame) background to the SAME analysis ROI so it matches
+        # the cropped measurement raw before its phase is subtracted.
+        ref_raw = self._work_crop3(self.phase_bkg[0])
         return ref_raw if getattr(ref_raw, "shape", None) == tuple(shape) else None
 
     def _compute_from_raw(self, zi):
@@ -1605,19 +1755,33 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         else:
             self.stack.setCurrentWidget(self.main_split)
 
+    def _on_ph_z_combo(self, idx):
+        """Phase-page Z dropdown -> select that Z (drives the whole refresh)."""
+        if idx >= 0:
+            self.z_slider.setValue(idx)
+
     def _mirror_phase_sliders(self):
-        """Copy the master sliders' ranges/values/visibility onto the phase-page
-        sliders (signals blocked so it never fights the two-way connections)."""
-        for src, dst in ((self.wl_slider, self.ph_wl), (self.z_slider, self.ph_z),
-                         (self.angle_slider, self.ph_a)):
+        """Copy the master λ/angle sliders' ranges/values/visibility onto the
+        phase-page controls, and fill the Z dropdown from the loaded positions
+        (signals blocked so it never fights the two-way connections)."""
+        for src, dst in ((self.wl_slider, self.ph_wl), (self.angle_slider, self.ph_a)):
             dst.blockSignals(True)
             dst.setMinimum(src.minimum()); dst.setMaximum(src.maximum())
             dst.setValue(src.value())
             dst.blockSignals(False)
-        self.ph_zrow.setVisible(self.zrow.isVisible())
-        self.ph_arow.setVisible(self.arow.isVisible())
+        # Z dropdown: one entry per position (in mm), current = the master z index.
+        self.ph_z_combo.blockSignals(True)
+        self.ph_z_combo.clear()
+        for z in self._z_axis:
+            self.ph_z_combo.addItem("--" if z != z else f"{z:.4f} mm")
+        self.ph_z_combo.setCurrentIndex(min(max(self.z_slider.value(), 0),
+                                            len(self._z_axis) - 1))
+        self.ph_z_combo.blockSignals(False)
+        # Base visibility on the data (the main panel is hidden while the phase
+        # page is shown, so its rows' isVisible() would read False here).
+        self.ph_zrow.setVisible(len(self._z_axis) > 1)
+        self.ph_arow.setVisible(len(self._a_axis) > 1)
         self.ph_lbl_wl.setText(self.lbl_wl.text())
-        self.ph_lbl_z.setText(self.lbl_z.text())
         self.ph_lbl_a.setText(self.lbl_a.text())
 
     def _on_phase_cmap(self, *a):
@@ -1632,8 +1796,13 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         page is shown (a full DFT per λ move is otherwise wasted)."""
         if not getattr(self, "phase_mode", False):
             return
-        # Keep the phase-page slider labels in step with the master view.
-        self.ph_lbl_z.setText(self.lbl_z.text()); self.ph_lbl_a.setText(self.lbl_a.text())
+        # Keep the phase-page controls in step with the master view.
+        self.ph_lbl_a.setText(self.lbl_a.text())
+        if (self.ph_z_combo.count() and self.ph_z_combo.currentIndex() != self.z_slider.value()):
+            self.ph_z_combo.blockSignals(True)
+            self.ph_z_combo.setCurrentIndex(min(max(self.z_slider.value(), 0),
+                                                self.ph_z_combo.count() - 1))
+            self.ph_z_combo.blockSignals(False)
         if self.wavelengths is not None and len(self.wavelengths):
             _i = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
             self.ph_lbl_wl.setText(f"{float(np.asarray(self.wavelengths)[_i]):.3f} µm")
@@ -1737,9 +1906,10 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         raw, _pos, path = self.phase_bkg
         compat = ""
         if self.infos:
-            cur = self.current_interferogram()[1]
+            cur = self.current_interferogram()[1]          # cropped to the analysis ROI
             if cur is not None:
-                compat = ("  —  compatible ✓" if raw.shape == cur.shape
+                refc = self._work_crop3(raw)               # crop the ref the same way
+                compat = ("  —  compatible ✓" if refc.shape == cur.shape
                           else f"  —  SHAPE MISMATCH ✗ (data is {tuple(cur.shape)})")
         state = "ON" if self.phase_bkg_on else "off"
         self.lbl_phase_bkg.setText(
