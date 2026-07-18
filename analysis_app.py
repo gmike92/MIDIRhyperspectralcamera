@@ -221,6 +221,13 @@ def _phase_cmap(name):
 
 _ROI_COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#e64980"]
 
+# LRU cube/raw caches: keep at most this many recent cubes, and never exceed this
+# many total bytes (a single giant cube still loads, but old ones are evicted).
+_CACHE_MAX_ITEMS = 6
+_CACHE_MAX_BYTES = 1_500_000_000        # ~1.5 GB across all cached cubes
+_SEL_DEBOUNCE_MS = 90                    # Z/angle: heavy (cube reload) -> longer
+_WL_DEBOUNCE_MS = 25                     # λ-slice: light (cached band) -> short
+
 # Palette for clicked-pixel spectra / interferograms (kept distinct from the ROI
 # colours so pixels and regions never clash). Each selected pixel keeps the same
 # colour in both the spectra plot and the interferogram plot.
@@ -331,13 +338,26 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._cluster_means = []       # cached per-cluster mean spectra
         self._cluster_key = None       # signature for the cluster-means cache
         self._svd_cum = None           # cached cumulative explained variance
-        self._cube_cache = {}          # z_index -> cube (current only)
-        self._raw_cache = {}           # z_index -> (positions, raw_interferogram)
+        # Bounded LRU caches (OrderedDict = insertion order): keep the last few
+        # decompressed cubes / raw interferograms so revisiting a Z/angle is
+        # instant instead of re-reading + decompressing a big .npz. Capped by
+        # BOTH item count and total bytes so huge cubes can't blow up RAM.
+        self._cube_cache = OrderedDict()   # z_index -> (wl, cube)
+        self._raw_cache = OrderedDict()    # z_index -> (positions, raw_interferogram, calibrated)
         self.sel_pixels = []           # list of (row, col) clicked pixels
         self.recompute_on = False      # compute map from raw interferogram window
         self.proc = None               # HyperspectralProcessor (lazy)
         self.phase_mode = False        # True while the phase-only page is shown
+        self.phase_bkg = None          # (ref_raw_cube, ref_positions, path) background
+        self.phase_bkg_on = False      # subtract the background phase (per-pixel)
         self._stokes_dirty = True      # Stokes panel needs (re)fill from loaded folder
+
+        # Debounce: slider drags fire valueChanged rapidly; coalesce the heavy
+        # refresh (cube reload + map/spectra/DFT) so only the settled value runs.
+        self._sel_timer = QtCore.QTimer(self); self._sel_timer.setSingleShot(True)
+        self._sel_timer.timeout.connect(self._do_selection_refresh)
+        self._wl_timer = QtCore.QTimer(self); self._wl_timer.setSingleShot(True)
+        self._wl_timer.timeout.connect(self._do_wl_refresh)
 
         self._build_ui()
 
@@ -400,6 +420,9 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         leftw = QtWidgets.QWidget(); left = QtWidgets.QVBoxLayout(leftw)
         self.iv = pg.ImageView()
         self.iv.view.invertY(True)
+        # Downsample big images for display (renders at screen resolution instead
+        # of pushing every pixel through the GPU each frame).
+        self.iv.getImageItem().setAutoDownsample(True)
         for w in (self.iv.ui.roiBtn, self.iv.ui.menuBtn, self.iv.ui.roiPlot):
             w.hide()
         self.iv.scene.sigMouseClicked.connect(self._on_click)
@@ -719,6 +742,29 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         btn_ph_exp.clicked.connect(self._export_phase)
         pc.addWidget(btn_ph_exp); pc.addStretch(1)
         ph.addLayout(pc)
+
+        # Background phase correction: load a background interferogram and subtract
+        # its per-pixel phase (removes the interferometer's instrumental phase,
+        # leaving the true spectral phase). Can phase + save the whole Z×θ stack.
+        pb = QtWidgets.QHBoxLayout()
+        btn_bkg = QtWidgets.QPushButton("Load background…")
+        btn_bkg.setToolTip("Load a background interferogram (.npz with raw_interferogram) "
+                           "of the SAME ROI + wedge scan. Its per-pixel phase is subtracted.")
+        btn_bkg.clicked.connect(self._phase_load_bkg)
+        self.chk_phase_bkg = QtWidgets.QCheckBox("Subtract background phase")
+        self.chk_phase_bkg.setEnabled(False)
+        self.chk_phase_bkg.toggled.connect(self._on_phase_bkg_toggled)
+        btn_phase_stack = QtWidgets.QPushButton("Phase Z×θ stack → save…")
+        btn_phase_stack.setToolTip("Phase-correct every cube in the loaded stack with the "
+                                   "background and save the phased spectrum cubes to a folder.")
+        btn_phase_stack.clicked.connect(self._phase_stack_save)
+        pb.addWidget(btn_bkg); pb.addWidget(self.chk_phase_bkg)
+        pb.addWidget(btn_phase_stack); pb.addStretch(1)
+        ph.addLayout(pb)
+        self.lbl_phase_bkg = QtWidgets.QLabel("Background: none loaded.")
+        self.lbl_phase_bkg.setStyleSheet("color:#888;"); self.lbl_phase_bkg.setWordWrap(True)
+        ph.addWidget(self.lbl_phase_bkg)
+
         self.ph_info = QtWidgets.QLabel(
             "Move the λ slider to change wavelength. The FT window + apodization "
             "are taken from the Interferogram / Recompute tab.")
@@ -883,8 +929,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.lbl_a.setText("--" if a != a else f"{a:.2f}°")
 
     def _on_selection_changed(self, *a):
-        """Either the Z or angle slider moved -> re-select the cube and refresh."""
+        """Z or angle slider moved. Update the label instantly and DEBOUNCE the
+        heavy refresh (a fresh cube reload) so dragging across a stack only loads
+        the position you land on, not every one in between."""
         self._update_slider_labels()
+        self._sel_timer.start(_SEL_DEBOUNCE_MS)
+
+    def _do_selection_refresh(self):
+        """Deferred heavy refresh for a settled Z/angle selection."""
         if self.infos and self._cur() is None:
             self.statusBar().showMessage("No cube acquired at this Z / angle combination.")
         self.refresh_map(); self.update_spectra()
@@ -902,14 +954,26 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         wl = np.asarray(wl) if wl is not None else self._saved_wavelengths
         return wl, cube
 
+    @staticmethod
+    def _trim_cache(cache):
+        """Evict oldest entries until within the item/byte caps (keep >=1)."""
+        def nbytes(v):
+            arr = v[1]
+            return int(arr.nbytes) if arr is not None else 0
+        while len(cache) > 1 and (
+                len(cache) > _CACHE_MAX_ITEMS
+                or sum(nbytes(v) for v in cache.values()) > _CACHE_MAX_BYTES):
+            cache.popitem(last=False)   # drop least-recently-used
+
     def current_cube(self):
         if not self.infos:
             return None
         zi = self._cur()
         if zi is None:
             return None
-        if zi not in self._cube_cache:
-            self._cube_cache.clear()
+        if zi in self._cube_cache:
+            self._cube_cache.move_to_end(zi)          # mark most-recently-used
+        else:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
             try:
                 wl, cube = self._base_cube(zi)
@@ -918,6 +982,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 # Cache the cube WITH its own wavelength axis so they never drift
                 # apart (files can differ in n_freq; recompute changes the axis).
                 self._cube_cache[zi] = (np.asarray(wl) if wl is not None else None, cube)
+                self._trim_cache(self._cube_cache)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
         wl, cube = self._cube_cache.get(zi, (None, None))
@@ -945,8 +1010,9 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         zi = self._cur()
         if zi is None:
             return None, None
-        if zi not in self._raw_cache:
-            self._raw_cache.clear()
+        if zi in self._raw_cache:
+            self._raw_cache.move_to_end(zi)
+        else:
             pos = raw = None; calibrated = False
             mi = self.infos[zi].get("map_index")
             try:
@@ -955,6 +1021,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             except Exception as e:  # noqa: BLE001
                 print("raw load:", e)
             self._raw_cache[zi] = (pos, raw, calibrated)
+            self._trim_cache(self._raw_cache)
         pos, raw, _ = self._raw_cache[zi]
         return pos, raw
 
@@ -963,6 +1030,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         (so recompute must NOT re-correct it)."""
         entry = self._raw_cache.get(self._cur())
         return bool(entry[2]) if entry else False
+
+    def _phase_ref_cube(self, shape):
+        """The background reference interferogram to phase-correct against, if one
+        is loaded, phasing is enabled, and its shape matches (else None)."""
+        if not self.phase_bkg_on or self.phase_bkg is None:
+            return None
+        ref_raw = self.phase_bkg[0]
+        return ref_raw if getattr(ref_raw, "shape", None) == tuple(shape) else None
 
     def _compute_from_raw(self, zi):
         pos, raw = self.current_interferogram()
@@ -976,7 +1051,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             n_freq=nfreq, apod_type=self.r_apod.currentText(),
             ft_window_mm=self.win_region.getRegion(),
             expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-            positions_calibrated=self.current_positions_calibrated())
+            positions_calibrated=self.current_positions_calibrated(),
+            reference_cube=self._phase_ref_cube(raw.shape))
 
     def _sync_wl_slider(self, nf=None):
         self._apply_wl_slider_range()
@@ -1463,6 +1539,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     # -- sliders / click ------------------------------------------------------
     def _on_wl(self, *a):
+        # Update the λ label instantly; debounce the map/phase recompute so a
+        # slider drag stays smooth (short delay -- a λ-slice is a cheap band pick).
+        if self.wavelengths is not None and len(self.wavelengths):
+            i = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
+            self.lbl_wl.setText(f"{np.asarray(self.wavelengths)[i]:.3f} µm")
+        self._wl_timer.start(_WL_DEBOUNCE_MS)
+
+    def _do_wl_refresh(self):
         if self.combo_map.currentText() == "λ slice":
             self.refresh_map()
         self._update_phase()
@@ -1571,7 +1655,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 pos, raw, lam, apod_type=self.r_apod.currentText(),
                 ft_window_mm=self.win_region.getRegion(),
                 expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-                positions_calibrated=self.current_positions_calibrated())
+                positions_calibrated=self.current_positions_calibrated(),
+                reference_cube=self._phase_ref_cube(raw.shape))
         except Exception as e:  # noqa: BLE001
             self.ph_info.setText(f"Phase compute failed: {e}")
             return
@@ -1594,9 +1679,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._last_phase = (amp, phase)
         axis_txt = ("calibrated axis (as-is)" if self.current_positions_calibrated()
                     else "raw axis + motor cal")
+        corr = ("BACKGROUND-CORRECTED phase" if info.get("phase_corrected")
+                else "raw phase (interferometer phase included)")
         lo_w, hi_w = self.win_region.getRegion()
         self.ph_info.setText(
-            f"λ = {lam:.4f} µm   |   ZPD {info['center_mm']:.4f} mm   |   "
+            f"λ = {lam:.4f} µm   |   {corr}   |   ZPD {info['center_mm']:.4f} mm   |   "
             f"FT window {lo_w:.3f}–{hi_w:.3f} mm   |   apod {self.r_apod.currentText()}   |   "
             f"{axis_txt}   |   phase masked below {self.ph_thresh.value():.3g}% of max amplitude")
 
@@ -1618,6 +1705,115 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         np.savetxt(path, data, fmt="%.6g", delimiter="\t",
                    header="col\trow\tamplitude\tphase_rad", comments="")
         self.statusBar().showMessage(f"Saved {data.shape[0]} rows to {path}", 5000)
+
+    # -- background phase correction ------------------------------------------
+    def _phase_load_bkg(self):
+        """Load a background interferogram (.npz with raw_interferogram) to phase
+        the measurement against (per-pixel instrumental-phase removal)."""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load background interferogram", "", "NumPy archive (*.npz)")
+        if not path:
+            return
+        try:
+            with np.load(path, allow_pickle=True) as d:
+                raw, pos, _cal = _read_raw(d, None)
+        except Exception as e:  # noqa: BLE001
+            self.statusBar().showMessage(f"could not read background: {e}", 6000)
+            return
+        if raw is None or pos is None:
+            self.lbl_phase_bkg.setText("Background: that file has no raw interferogram.")
+            return
+        self.phase_bkg = (np.asarray(raw, dtype=np.float32), np.asarray(pos, float), path)
+        self.chk_phase_bkg.setEnabled(True)
+        self._describe_phase_bkg()
+        if self.chk_phase_bkg.isChecked():
+            self._on_phase_bkg_toggled(True)          # already on -> just refresh
+        else:
+            self.chk_phase_bkg.setChecked(True)       # -> toggles on + refreshes
+
+    def _describe_phase_bkg(self):
+        if self.phase_bkg is None:
+            self.lbl_phase_bkg.setText("Background: none loaded."); return
+        raw, _pos, path = self.phase_bkg
+        compat = ""
+        if self.infos:
+            cur = self.current_interferogram()[1]
+            if cur is not None:
+                compat = ("  —  compatible ✓" if raw.shape == cur.shape
+                          else f"  —  SHAPE MISMATCH ✗ (data is {tuple(cur.shape)})")
+        state = "ON" if self.phase_bkg_on else "off"
+        self.lbl_phase_bkg.setText(
+            f"Background: {os.path.basename(path)}  {tuple(raw.shape)}{compat}   [correction {state}]")
+
+    def _on_phase_bkg_toggled(self, on):
+        self.phase_bkg_on = bool(on) and self.phase_bkg is not None
+        self._describe_phase_bkg()
+        if self.recompute_on:          # main view re-derives phased spectra
+            self._invalidate_and_refresh()
+        self._update_phase()           # phase page shows the corrected phase
+
+    def _phase_stack_save(self):
+        """Phase-correct EVERY cube in the loaded (Z × θ) stack with the loaded
+        background and save the phased spectrum cubes to a new folder."""
+        if self.phase_bkg is None:
+            self.statusBar().showMessage("Load a background first.", 4000)
+            return
+        if not self.infos:
+            return
+        dest = QtWidgets.QFileDialog.getExistingDirectory(self, "Save phased Z×θ stack to…")
+        if not dest:
+            return
+        ref_raw = self.phase_bkg[0]
+        if self.proc is None:
+            self.proc = HyperspectralProcessor()
+        wl0, wl1 = self.r_wl0.value(), self.r_wl1.value()
+        apod = self.r_apod.currentText(); win = list(self.win_region.getRegion())
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        saved = skipped = 0
+        try:
+            for k, info in enumerate(self.infos):
+                self.statusBar().showMessage(f"phasing {k+1}/{len(self.infos)}…")
+                QtWidgets.QApplication.processEvents()
+                mi = info.get("map_index")
+                with np.load(info["path"], allow_pickle=True) as d:
+                    raw, pos, calibrated = _read_raw(d, mi)
+                    meta = _file_meta(d)
+                    keep = {key: d[key] for key in (
+                        "z_value_mm", "z_unit", "angle_value_deg", "angle_unit",
+                        "background", "background_subtracted", "saturation_mask",
+                        "twins_positions_mm", "twins_positions_calibrated_mm")
+                        if key in d.files}
+                if raw is None or pos is None or ref_raw.shape != raw.shape:
+                    skipped += 1
+                    continue
+                nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
+                wl, cube = self.proc.compute_hyperspectral(
+                    pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
+                    ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
+                    search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
+                    reference_cube=ref_raw)
+                if cube is None:
+                    skipped += 1
+                    continue
+                meta = dict(meta)
+                meta.update(phase_corrected=True,
+                            phase_background=os.path.basename(self.phase_bkg[2]),
+                            recompute_window_mm=win, recompute_apod=apod,
+                            recompute_nfreq=int(nfreq))
+                kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
+                          raw_interferogram=np.asarray(raw, np.float32),
+                          metadata=np.array(meta, dtype=object),
+                          metadata_json=json.dumps(meta, default=str, indent=2))
+                kw.update(keep)
+                base = os.path.splitext(os.path.basename(info["path"]))[0]
+                np.savez(os.path.join(dest, base + ".npz"), **kw)  # uncompressed: fast write
+                saved += 1
+            msg = f"phased + saved {saved} cube(s) to {dest}"
+            if skipped:
+                msg += f"  ({skipped} skipped — no raw / shape mismatch)"
+            self.statusBar().showMessage(msg)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
 
     def _on_click(self, ev):
         cube = self.current_cube()
@@ -1921,7 +2117,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 if mask is not None:
                     kw["saturation_mask"] = np.asarray(mask, bool)
                 base = os.path.splitext(os.path.basename(info["path"]))[0]
-                np.savez_compressed(os.path.join(out, base + "_rewin.npz"), **kw)
+                np.savez(os.path.join(out, base + "_rewin.npz"), **kw)  # uncompressed: fast write
                 saved += 1
             self.statusBar().showMessage(f"recomputed + saved {saved} position(s) to {out}")
         finally:
