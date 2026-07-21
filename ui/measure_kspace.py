@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from datetime import datetime
 
 import numpy as np
@@ -510,6 +511,7 @@ class MeasurePanel(QWidget):
         self.background_map = None             # binned-ROI background saved with the cube
         self.background_subtracted = False
         self._abort = False
+        self._paused = False                   # Pause holds the worker at loop boundaries
         self._low_disk_warned = False
         self.viewer = None
         self.wavelengths = None
@@ -896,9 +898,15 @@ class MeasurePanel(QWidget):
         row = QHBoxLayout()
         self.btn_run = QPushButton("Acquire")
         self.btn_run.clicked.connect(self._start)
+        self.btn_pause = QPushButton("Pause"); self.btn_pause.setEnabled(False)
+        self.btn_pause.setToolTip("Hold the scan at the next interferogram / DFT "
+                                  "boundary (the current cube finishes first). "
+                                  "Press again to resume.")
+        self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_stop = QPushButton("Stop"); self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
-        row.addWidget(self.btn_run); row.addWidget(self.btn_stop)
+        row.addWidget(self.btn_run); row.addWidget(self.btn_pause)
+        row.addWidget(self.btn_stop)
         v.addLayout(row)
         row2 = QHBoxLayout()
         self.btn_recompute = QPushButton("Recompute")
@@ -1249,8 +1257,11 @@ class MeasurePanel(QWidget):
         self._save_raw_flag = self.chk_save_raw.isChecked()
         self._per_position_saved = False
         self._abort = False
+        self._paused = False
         self.raw_cubes, self.raw_positions = [], []
         self.btn_run.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("Pause")
         self.btn_stop.setEnabled(True)
         self.sp.freeze(True)
         grid_total = (len(z_targets) if zscan else 1) * (len(a_targets) if ascan else 1)
@@ -1276,7 +1287,21 @@ class MeasurePanel(QWidget):
 
     def _stop(self) -> None:
         self._abort = True
+        self._paused = False   # release the worker if it's parked in a pause
         self.sig_status.emit("stopping...")
+
+    def _toggle_pause(self) -> None:
+        """Pause/resume the running scan. The worker parks at the next loop
+        boundary (finishing the in-flight cube / DFT first), so the stages are
+        never stopped mid-move. Stop still works while paused."""
+        self._paused = not self._paused
+        self.btn_pause.setText("Resume" if self._paused else "Pause")
+        self.sig_status.emit("paused" if self._paused else "resuming...")
+
+    def _wait_if_paused(self) -> None:
+        """Block the worker thread while paused (polling so Stop still aborts)."""
+        while self._paused and not self._abort:
+            time.sleep(0.1)
 
     def _recompute(self) -> None:
         """Re-run the DFT on the last scan's RAW interferogram with the current
@@ -1496,12 +1521,14 @@ class MeasurePanel(QWidget):
             acquired = []   # [{z, zi, a, ai, gi, positions, datacube}, ...]
             gi = 0
             for zi, z in enumerate(z_targets):
+                self._wait_if_paused()   # park before advancing to the next Z
                 if self._abort:
                     break
                 if z is not None:
                     self.sig_status.emit(f"moving Z to {z:.4f} mm")
                     self.sp.delay.move_to_mm(float(z))  # wait=True blocks until done
                 for ai, a in enumerate(a_targets):
+                    self._wait_if_paused()   # park here between cubes if paused
                     if self._abort:
                         break
                     g, label = gi, grid_label(z, a)
@@ -1569,6 +1596,7 @@ class MeasurePanel(QWidget):
                     f"acquisition done ({n_acq} cube{'s' if n_acq != 1 else ''}); "
                     f"computing per-pixel DFTs...")
             for k, item in enumerate(acquired):
+                self._wait_if_paused()   # park between DFTs if paused
                 if self._abort:
                     break
                 z, zi = item["z"], item["zi"]
@@ -1645,6 +1673,9 @@ class MeasurePanel(QWidget):
     def _on_done(self, wavelengths, cubes, z_values, sat_masks) -> None:
         self.btn_run.setEnabled(True)
         self.btn_recompute.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("Pause")
+        self._paused = False
         self.btn_stop.setEnabled(False)
         self.sp.freeze(False)
         if not cubes:
