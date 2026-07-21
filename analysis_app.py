@@ -760,6 +760,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.ph_thresh.setSuffix(" % max amp"); self.ph_thresh.setDecimals(2)
         self.ph_thresh.valueChanged.connect(self._update_phase)
         pc.addWidget(self.ph_thresh)
+        # Soft amplitude mask: multiply the wrapped phase by the normalised
+        # amplitude (left image) so low-amplitude pixels fade toward 0 -- a
+        # per-wavelength weighting, applied ON TOP of the threshold mask.
+        self.chk_ph_ampmask = QtWidgets.QCheckBox("× amplitude")
+        self.chk_ph_ampmask.setToolTip("Weight the phase by the normalised amplitude "
+                                       "(left image): low-amplitude pixels fade to zero.")
+        self.chk_ph_ampmask.toggled.connect(self._update_phase)
+        pc.addWidget(self.chk_ph_ampmask)
         btn_ph_exp = QtWidgets.QPushButton("Export amp+phase…")
         btn_ph_exp.clicked.connect(self._export_phase)
         pc.addWidget(btn_ph_exp); pc.addStretch(1)
@@ -1840,6 +1848,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ph_masked = phase.copy()
         if amax > 0:
             ph_masked[amp < thr * amax] = np.nan     # NaN -> transparent (grey bg)
+        # Optional soft mask: weight the phase by the normalised amplitude so
+        # low-amplitude pixels fade toward zero (NaN threshold-masked pixels stay
+        # NaN, since NaN * x = NaN). Applied per wavelength (this map's amplitude).
+        if self.chk_ph_ampmask.isChecked() and amax > 0:
+            ph_masked = ph_masked * (amp / amax)
         cm_amp = _get_cmap(self.combo_cmap.currentText())
         self.ph_img_amp.setImage(amp, autoLevels=False)
         self.ph_cbar_amp.setColorMap(cm_amp)
@@ -1854,7 +1867,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.ph_info.setText(
             f"λ = {lam:.4f} µm   |   {corr}   |   ZPD {info['center_mm']:.4f} mm   |   "
             f"FT window {lo_w:.3f}–{hi_w:.3f} mm   |   apod {self.r_apod.currentText()}   |   "
-            f"{axis_txt}   |   phase masked below {self.ph_thresh.value():.3g}% of max amplitude")
+            f"{axis_txt}   |   phase masked below {self.ph_thresh.value():.3g}% of max amplitude"
+            + ("   |   × amplitude weighting" if self.chk_ph_ampmask.isChecked() else ""))
 
     def _export_phase(self):
         lp = getattr(self, "_last_phase", None)
