@@ -703,8 +703,8 @@ class MeasurePanel(QWidget):
                                 "position from the ROI average and the maps.")
         grid.addWidget(self.chk_sat, 0, 0, 1, 2)
         self.spin_sat = QSpinBox(); self.spin_sat.setRange(1, 65535)
-        self.spin_sat.setValue(16383); self.spin_sat.setSuffix(" cts")
-        self.spin_sat.setToolTip("Saturation count level (14-bit full scale = 16383).")
+        self.spin_sat.setValue(65535); self.spin_sat.setSuffix(" cts")
+        self.spin_sat.setToolTip("Saturation count level (Orca 16-bit full scale = 65535).")
         grid.addWidget(QLabel("Saturation level"), 1, 0); grid.addWidget(self.spin_sat, 1, 1)
 
         self.chk_svd = QCheckBox("SVD denoise (low-rank)")

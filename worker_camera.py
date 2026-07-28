@@ -49,6 +49,13 @@ def publish_status(frame_queue: mp.Queue, status: CameraStatus) -> None:
             "raw_peak_count": status.raw_peak_count,
             "board_temp_c": status.board_temp_c,
             "fpa_temp_k": status.fpa_temp_k,
+            "binning": status.binning,
+            "roi_hsize": status.roi_hsize,
+            "roi_vsize": status.roi_vsize,
+            "roi_hpos": status.roi_hpos,
+            "roi_vpos": status.roi_vpos,
+            "sensor_width": status.sensor_width,
+            "sensor_height": status.sensor_height,
         },
     })
 
@@ -154,6 +161,25 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                 if cmd_type == "set_average":
                     if hasattr(camera, "set_average"):
                         camera.set_average(int(command.get("value", 1)))
+                    publish_status(frame_queue, camera.get_status())
+                    continue
+                if cmd_type in ("set_binning", "set_roi", "set_full_frame"):
+                    # Binning / subarray can only change while idle, so briefly
+                    # stop, apply, and restart if we were streaming.
+                    was_streaming = camera.status.acquiring
+                    camera.stop_acquisition()
+                    if cmd_type == "set_binning" and hasattr(camera, "set_binning"):
+                        camera.set_binning(int(command.get("value", 1)))
+                    elif cmd_type == "set_roi" and hasattr(camera, "set_roi"):
+                        camera.set_roi(int(command.get("hsize", 0)),
+                                       int(command.get("vsize", 0)),
+                                       int(command.get("hpos", 0)),
+                                       int(command.get("vpos", 0)))
+                    elif cmd_type == "set_full_frame" and hasattr(camera, "set_full_frame"):
+                        camera.set_full_frame()
+                    if was_streaming:
+                        camera.start_acquisition()
+                    last_frame_time = time.time()   # avoid a spurious reconnect
                     publish_status(frame_queue, camera.get_status())
                     continue
                 if cmd_type == "start":

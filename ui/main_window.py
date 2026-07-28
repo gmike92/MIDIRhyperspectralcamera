@@ -42,7 +42,7 @@ class MainWindow(QMainWindow):
         self,
         frame_queue,
         control_queue,
-        initial_mode: str = "irc806",
+        initial_mode: str = "orca",
         shared_frame_name: str = "",
         shared_frame_shape: tuple[int, int] = (0, 0),
     ):
@@ -57,7 +57,7 @@ class MainWindow(QMainWindow):
             self.shared_frame_handle = shared_memory.SharedMemory(name=shared_frame_name)
             self.shared_frame = np.ndarray(self.shared_frame_shape, dtype=np.uint16, buffer=self.shared_frame_handle.buf)
 
-        self.setWindowTitle("IRC806 MWIR Live Viewer")
+        self.setWindowTitle("Hyperspectral Camera — Hamamatsu Orca + TWINS (SmarAct MCS2)")
         self.resize(1280, 820)
 
         self.background_frame = None
@@ -68,7 +68,7 @@ class MainWindow(QMainWindow):
         self.latest_frame = None
         self.latest_status = {}        # most recent camera status (for metadata)
         self.last_display_frame = None
-        self._display_levels = (0.0, 16383.0)
+        self._display_levels = (0.0, 65535.0)   # Orca is 16-bit
         self.profile_pixel = None  # (row, col) for X/Y profiles; None = center
         self.save_dir = r"D:\CAMERA"
         self.save_filename = "filename"
@@ -98,7 +98,9 @@ class MainWindow(QMainWindow):
         controls_tabs.addTab(self._make_tab([
             self._build_camera_group(),
             self._build_processing_group(),
-            self._build_correction_group(),
+            # NUC / BPR correction is IRC806-specific and has no Orca (DCAM)
+            # equivalent, so the correction group is omitted for this build.
+            # self._build_correction_group(),
             self._build_save_group(),
             self._build_measurements_group(),
         ]), "Camera")
@@ -109,7 +111,7 @@ class MainWindow(QMainWindow):
         self.twins_scan_panel = TwinsScanPanel(
             self.stages_panel.twins_ctl,
             frame_source=lambda: self.latest_frame,
-            roi_provider=self.get_roi_bounds,
+            roi_provider=self.get_measurement_roi,
             save_dir=os.path.join(self.save_dir, "twins"))
         controls_tabs.addTab(
             self._make_tab([self.stages_panel.twins_group, self.twins_scan_panel]),
@@ -117,7 +119,7 @@ class MainWindow(QMainWindow):
         self.measure_panel = MeasurePanel(
             self.stages_panel,
             frame_source=lambda: self.latest_frame,
-            roi_provider=self.get_roi_bounds,
+            roi_provider=self.get_measurement_roi,
             roi_show=self.set_roi_visible,
             bg_provider=lambda: (self.background_frame, self.use_bg_subtraction),
             # Save K-space files into the SAME folder set in the camera Save group.
@@ -138,17 +140,25 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         viewer_column.addWidget(self.status_label)
 
-        # ROI selector lives on the live view: tick to show the cyan box, drag
-        # it over the region of interest; measurements (TWINS / hyperspectral)
-        # read and save these bounds.
+        # Camera ROI (hardware subarray) is set from the live view: tick to show
+        # the cyan box, drag it over the region, then "Apply ROI" so the camera
+        # reads out ONLY that region. "Full frame" restores the whole sensor.
         roi_row = QHBoxLayout()
-        self.roi_checkbox = QCheckBox("Show measurement ROI (drag the box on the image)")
+        self.roi_checkbox = QCheckBox("Show camera ROI (drag the box, then Apply)")
         self.roi_checkbox.toggled.connect(self.set_roi_visible)
-        self.roi_bounds_label = QLabel("ROI: full frame")
+        self.roi_bounds_label = QLabel("Camera ROI: full frame")
         self.roi_bounds_label.setStyleSheet("color:#888;")
+        self.btn_apply_roi = QPushButton("Apply ROI")
+        self.btn_apply_roi.setToolTip("Set the camera hardware subarray to the box")
+        self.btn_apply_roi.clicked.connect(self.on_apply_roi)
+        self.btn_full_frame = QPushButton("Full frame")
+        self.btn_full_frame.setToolTip("Reset the camera to the full sensor")
+        self.btn_full_frame.clicked.connect(self.on_full_frame)
         roi_row.addWidget(self.roi_checkbox)
         roi_row.addWidget(self.roi_bounds_label)
         roi_row.addStretch()
+        roi_row.addWidget(self.btn_apply_roi)
+        roi_row.addWidget(self.btn_full_frame)
         viewer_column.addLayout(roi_row)
 
         self.export_panel = QWidget()
@@ -161,7 +171,7 @@ class MainWindow(QMainWindow):
         # right-aligned. Updates every 5 min, or on demand via the Poll button.
         temp_row = QHBoxLayout()
         temp_row.addStretch()
-        self.temp_value_label = QLabel("FPGA/Board: -- °C   FPA: -- K")
+        self.temp_value_label = QLabel("Sensor: -- °C")
         self.temp_value_label.setStyleSheet("font-weight: 600; font-size: 13px;")
         temp_row.addWidget(self.temp_value_label)
         self.btn_poll_temp = QPushButton("Poll")
@@ -197,7 +207,8 @@ class MainWindow(QMainWindow):
         self.image_plot.addItem(self.h_line, ignoreBounds=True)
 
         # Draggable rectangular ROI for measurements (TWINS scan / hyperspectral).
-        # Hidden until "Show ROI" is enabled; bounds read via get_roi_bounds().
+        # Hidden until "Show camera ROI" is enabled; the box drives the hardware
+        # subarray via on_apply_roi() (bounds read via _roi_box_bounds()).
         self.roi = pg.RectROI([260, 200], [120, 120],
                               pen=pg.mkPen("c", width=2))
         self.roi.addScaleHandle([1, 1], [0, 0])
@@ -211,7 +222,7 @@ class MainWindow(QMainWindow):
 
         self.color_map = self._make_color_map("inferno")
         self.color_bar = pg.ColorBarItem(
-            values=(0.0, 16383.0),  # 14-bit default; overridden by display range
+            values=(0.0, 65535.0),  # 16-bit default; overridden by display range
             colorMap=self.color_map,
             interactive=False,
             width=18,
@@ -271,23 +282,24 @@ class MainWindow(QMainWindow):
             layout.addWidget(_w)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["irc806", "mock", "auto"])
+        self.mode_combo.addItems(["orca", "mock", "auto"])
         self.mode_combo.setCurrentText(self.current_mode)
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)
 
-        # Integration time. IRC806 ExposureTime max is ~1 frame time (8 ms at
-        # 120 Hz); cap the UI so a stream-freezing value can't be requested.
-        self.integration_label = QLabel("Integration time: 0.30 ms")
+        # Exposure time. The Orca sCMOS supports a wide exposure range; the UI
+        # spans 0.01..1000 ms (use the spin box for precise entry). The slider is
+        # in units of 0.01 ms.
+        self.integration_label = QLabel("Exposure time: 10.00 ms")
         self.integration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.integration_slider.setRange(1, 800)   # x0.01 ms -> 0.01..8.00 ms
-        self.integration_slider.setValue(30)       # 0.30 ms start
+        self.integration_slider.setRange(1, 100000)   # x0.01 ms -> 0.01..1000 ms
+        self.integration_slider.setValue(1000)         # 10.0 ms start
         self.integration_slider.valueChanged.connect(self.on_integration_slider_changed)
         self.integration_spin = QDoubleSpinBox()
         self.integration_spin.setDecimals(2)
-        self.integration_spin.setRange(0.01, 8.0)
-        self.integration_spin.setSingleStep(0.05)
-        self.integration_spin.setValue(0.3)
+        self.integration_spin.setRange(0.01, 1000.0)
+        self.integration_spin.setSingleStep(1.0)
+        self.integration_spin.setValue(10.0)
         self.integration_spin.valueChanged.connect(self.on_integration_spin_changed)
         layout.addWidget(self.integration_label)
         layout.addWidget(self.integration_slider)
@@ -299,6 +311,19 @@ class MainWindow(QMainWindow):
         self.average_spin.valueChanged.connect(self.on_average_changed)
         layout.addWidget(QLabel("Averaging"))
         layout.addWidget(self.average_spin)
+
+        # Hardware binning (1/2/4) -- combines sensor pixels on the camera.
+        self.binning_combo = QComboBox()
+        self.binning_combo.addItems(["1", "2", "4"])
+        self.binning_combo.currentTextChanged.connect(self.on_binning_changed)
+        bin_row = QHBoxLayout()
+        bin_row.addWidget(QLabel("Binning"))
+        bin_row.addWidget(self.binning_combo)
+        bin_row.addStretch()
+        layout.addLayout(bin_row)
+
+        # (The camera ROI is set by dragging the box on the live image and
+        #  clicking "Apply ROI" there -- see the viewer's ROI row.)
 
         start_button = QPushButton("Start")
         start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
@@ -373,7 +398,7 @@ class MainWindow(QMainWindow):
         self.display_max_spin = QDoubleSpinBox()
         self.display_max_spin.setDecimals(0)
         self.display_max_spin.setRange(1, 65535)
-        self.display_max_spin.setValue(16383)
+        self.display_max_spin.setValue(65535)
         self.display_max_spin.setPrefix("Max ")
         self.display_min_spin.valueChanged.connect(self.on_display_range_changed)
         self.display_max_spin.valueChanged.connect(self.on_display_range_changed)
@@ -557,8 +582,8 @@ class MainWindow(QMainWindow):
         return group
 
     def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
-        integration_ms = float(np.clip(integration_ms, 0.01, 8.0))
-        self.integration_label.setText(f"Integration time: {integration_ms:.2f} ms")
+        integration_ms = float(np.clip(integration_ms, 0.01, 1000.0))
+        self.integration_label.setText(f"Exposure time: {integration_ms:.2f} ms")
 
         slider_value = int(round(integration_ms * 100.0))
         if self.integration_slider.value() != slider_value:
@@ -582,6 +607,40 @@ class MainWindow(QMainWindow):
 
     def on_average_changed(self, value: int) -> None:
         self.control_queue.put({"type": "set_average", "value": int(value)})
+
+    def on_binning_changed(self, text: str) -> None:
+        try:
+            binning = int(text)
+        except (TypeError, ValueError):
+            return
+        self.control_queue.put({"type": "set_binning", "value": binning})
+
+    def on_apply_roi(self) -> None:
+        """Set the camera hardware subarray to the dragged box. The box is in the
+        CURRENT delivered-frame pixels, which may already be a subarray at offset
+        (roi_hpos, roi_vpos) and binned, so map it back to unbinned sensor px."""
+        box = self._roi_box_bounds()
+        if box is None:
+            self.status_label.setText("Draw the ROI box on the image first (tick 'Show camera ROI').")
+            return
+        r0, r1, c0, c1 = box
+        s = self.latest_status or {}
+        binning = int(s.get("binning", 1) or 1)
+        off_h = int(s.get("roi_hpos", 0) or 0)
+        off_v = int(s.get("roi_vpos", 0) or 0)
+        hsize = (c1 - c0) * binning
+        vsize = (r1 - r0) * binning
+        hpos = off_h + c0 * binning
+        vpos = off_v + r0 * binning
+        self.control_queue.put({"type": "set_roi", "hsize": hsize, "vsize": vsize,
+                                "hpos": hpos, "vpos": vpos})
+        # The delivered frame becomes the ROI, so the box's old coords are stale:
+        # hide it (re-tick to refine further).
+        self.roi_checkbox.setChecked(False)
+
+    def on_full_frame(self) -> None:
+        self.control_queue.put({"type": "set_full_frame"})
+        self.roi_checkbox.setChecked(False)
 
     def connect_selected_mode(self) -> None:
         self.current_mode = self.mode_combo.currentText()
@@ -667,17 +726,23 @@ class MainWindow(QMainWindow):
         self._update_roi_label()
 
     def _update_roi_label(self) -> None:
-        roi = self.get_roi_bounds()
-        if roi is None:
-            self.roi_bounds_label.setText("ROI: full frame")
+        box = self._roi_box_bounds()
+        if box is None:
+            self.roi_bounds_label.setText("Camera ROI: full frame")
         else:
-            r0, r1, c0, c1 = roi
+            r0, r1, c0, c1 = box
             self.roi_bounds_label.setText(
-                f"ROI: rows {r0}-{r1}, cols {c0}-{c1}  ({r1-r0}×{c1-c0} px)")
+                f"Box: rows {r0}-{r1}, cols {c0}-{c1}  ({c1-c0}×{r1-r0} px) — Apply to set")
 
-    def get_roi_bounds(self):
-        """Current ROI as (row0, row1, col0, col1) clamped to the frame, or None
-        when the ROI box is hidden / there is no frame yet (-> full-frame mean)."""
+    def get_measurement_roi(self):
+        """The hyperspectral measurement processes the WHOLE delivered frame:
+        the camera hardware ROI already restricts the field of view, so there is
+        no separate software crop. Always None (= full delivered frame)."""
+        return None
+
+    def _roi_box_bounds(self):
+        """The draggable box as (row0, row1, col0, col1) in CURRENT delivered-frame
+        pixels, clamped to the frame, or None when the box is hidden / no frame."""
         if self.latest_frame is None or not self.roi.isVisible():
             return None
         try:
@@ -864,6 +929,9 @@ class MainWindow(QMainWindow):
             "camera_serial": s.get("serial_number"),
             "exposure_ms": s.get("exposure_ms"),
             "averaging": s.get("average_count"),
+            "binning": s.get("binning"),
+            "roi_hpos_vpos_hsize_vsize": [s.get("roi_hpos"), s.get("roi_vpos"),
+                                          s.get("roi_hsize"), s.get("roi_vsize")],
             "fpa_temp_k": s.get("fpa_temp_k"),
             "board_temp_c": s.get("board_temp_c"),
             "nuc_corrected": (self.nuc_checkbox.isChecked()
@@ -896,12 +964,19 @@ class MainWindow(QMainWindow):
             self.average_spin.blockSignals(False)
         self._set_integration_value(exposure_ms, emit=False)
 
-        # Temperatures (board/FPGA in °C, FPA in K). NaN -> "--".
+        # Binning (discrete) -- keep the combo in sync with the camera.
+        binning = int(status.get("binning", 1) or 1)
+        if hasattr(self, "binning_combo") and self.binning_combo.currentText() != str(binning):
+            self.binning_combo.blockSignals(True)
+            self.binning_combo.setCurrentText(str(binning))
+            self.binning_combo.blockSignals(False)
+
+        # (Camera ROI is driven from the live-view box + Apply, not from status.)
+
+        # Orca sensor temperature (°C via DCAM). NaN -> "--".
         board = float(status.get("board_temp_c", float("nan")))
-        fpa = float(status.get("fpa_temp_k", float("nan")))
         b_txt = f"{board:.1f} °C" if board == board else "-- °C"
-        f_txt = f"{fpa:.1f} K" if fpa == fpa else "-- K"
-        self.temp_value_label.setText(f"FPGA/Board: {b_txt}   FPA: {f_txt}")
+        self.temp_value_label.setText(f"Sensor: {b_txt}")
 
         state = "connected" if status.get("connected") else "offline"
         acquisition = "acquiring" if status.get("acquiring") else "idle"

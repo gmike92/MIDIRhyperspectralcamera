@@ -1,7 +1,40 @@
+# Hyperspectral Camera — Hamamatsu Orca + TWINS (SmarAct MCS2)
+
+> **This build is an adaptation of the MIDIR app for a different bench.**
+> It keeps the full TWINS Fourier-transform hyperspectral workflow, DSP,
+> HyperViewer and analysis tools unchanged, and swaps only the two hardware
+> backends:
+>
+> | | Original (MIDIR) | This build |
+> |---|---|---|
+> | Camera | IRCameras IRC806 (MWIR, 14-bit) | **Hamamatsu Orca Flash** (sCMOS, 16-bit) via DCAM |
+> | TWINS wedge stage | SmarAct **SCU3D** (ctypes) | SmarAct **MCS2** / SLC-2460 (`smaract.ctl`, closed-loop, pm) |
+>
+> **Run it now with no hardware:** `python main.py --mode mock` — the camera is a
+> synthetic beam and every stage defaults to its Simulate mode, so the whole
+> acquire → per-pixel FFT → viewer path works offline.
+>
+> **What you must supply for real measurements** (the DSP is otherwise unchanged):
+> 1. **Your TWINS calibration files** — `Twins/ASRC calibration/parameters_cal.txt`
+>    (stage position → wavelength) and `parameters_int.txt` (motor nonlinearity).
+>    The ones in the repo are for the original MWIR TWINS unit and will give wrong
+>    wavelengths for your interferometer/detector.
+> 2. **The correct spectral band + ZPD** for your Orca+TWINS. The Orca is a
+>    visible/NIR sCMOS camera, so the app's default λ range (**3.8–4.4 µm**, MWIR)
+>    and ZPD/scan-range defaults in the *TWINS* and *Measure* tabs must be set to
+>    your actual band before results are meaningful.
+> 3. **MCS2 wiring** — the wedge channel index / device locator and the
+>    HOME/SAFE positions in `instruments/twins_stage.py`.
+>
+> Everything below describes the original MIDIR app; it still applies except for
+> the camera/stage specifics above.
+
+---
+
 # MIDIR Hyperspectral Camera
 
-A PyQt6 acquisition + analysis application for **static mid-IR hyperspectral
-imaging**: an IRCameras **IRC806** MWIR camera (640×512 InSb, 14-bit) combined
+A PyQt6 acquisition + analysis application for **static hyperspectral
+imaging**: an area camera combined
 with a **NIREOS TWINS** common-path birefringent interferometer. The TWINS wedge
 is stepped, N frames are grabbed per step, and a per-pixel interferogram is built
 and Fourier-transformed into a spectral cube. MWIR band of interest **3.8–4.4 µm**.

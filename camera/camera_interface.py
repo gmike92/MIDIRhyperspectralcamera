@@ -23,6 +23,13 @@ class CameraStatus:
     job_file_path: str = ""
     average_count: int = 1
     exposure_ms: float = 10.0
+    binning: int = 1                     # hardware binning factor (1, 2, 4)
+    roi_hsize: int = 0                   # hardware subarray, unbinned sensor px
+    roi_vsize: int = 0                   # (0 x 0 = full frame)
+    roi_hpos: int = 0
+    roi_vpos: int = 0
+    sensor_width: int = 0                # full-sensor size (unbinned), for ROI limits
+    sensor_height: int = 0
     frame_counter: int = 0
     raw_peak_count: float = 0.0
     board_temp_c: float = float("nan")   # FPGA/electronics board temperature (°C)

@@ -1,4 +1,5 @@
-# MIDIR hyperspectral camera app (PyQt6). 64-bit Python 3.8-3.12.
+# Hyperspectral camera app (PyQt6). 64-bit Python 3.9-3.13.
+# Pure-software / mock-mode dependencies (needed for `--mode mock`):
 PyQt6
 pyqtgraph
 numpy
@@ -6,8 +7,9 @@ scipy
 pandas
 Pillow
 loguru
-pythonnet
-# Plus, for the real camera + stages (not needed for `--mode mock`):
-#  - Pleora eBUS runtime, system-wide  (Common Files\Pleora\eBUS SDK\PvDotNet.dll)
-#  - Thorlabs Kinesis                  (delay stage + rotator, KDC101)
-#  - SmarAct SCU3D driver              (TWINS wedge: SCU3DControl.dll)
+# Optional, only for the real hardware (NOT needed for `--mode mock`):
+#  - Hamamatsu DCAM-API + dcamapi runtime   (Orca Flash camera)
+#      driven through camera/hamamatsu_backend.py -> ../Hamamatsu_ScopeFoundry/CameraDevice.py
+#  - SmarAct MCS2 SDK  (smaract.ctl / SmarActCTL.dll)   (TWINS wedge, SLC-2460)
+#      pip package: `smaract` (from the SmarAct MCS2 software installer)
+#  - Thorlabs Kinesis + pythonnet           (optional delay stage + rotator, KDC101)

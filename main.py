@@ -13,15 +13,18 @@ from worker_camera import camera_worker
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="IRC806 MWIR live viewer")
+    parser = argparse.ArgumentParser(
+        description="Hyperspectral camera live viewer (Hamamatsu Orca + TWINS/SmarAct MCS2)")
     parser.add_argument(
         "--mode",
-        choices=("auto", "irc806", "mock"),
-        default="irc806",
-        help="Camera backend (irc806 = IRCameras MWIR via Pleora eBUS)",
+        choices=("auto", "orca", "mock"),
+        default="orca",
+        help="Camera backend (orca = Hamamatsu Orca Flash via DCAM; "
+             "mock = synthetic beam; auto = try orca then fall back to mock)",
     )
-    parser.add_argument("--fps", type=float, default=120.0,
-                        help="Max acquisition rate (cap); camera native is 120 Hz")
+    parser.add_argument("--fps", type=float, default=60.0,
+                        help="Max acquisition rate cap (Hz); the camera exposure sets "
+                             "the real rate")
     return parser.parse_args()
 
 
