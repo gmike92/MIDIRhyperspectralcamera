@@ -31,20 +31,19 @@
 
 ---
 
-# MIDIR Hyperspectral Camera
+# VIS-NIR Hyperspectral Camera
 
 A PyQt6 acquisition + analysis application for **static hyperspectral
 imaging**: an area camera combined
 with a **NIREOS TWINS** common-path birefringent interferometer. The TWINS wedge
 is stepped, N frames are grabbed per step, and a per-pixel interferogram is built
-and Fourier-transformed into a spectral cube. MWIR band of interest **3.8–4.4 µm**.
+and Fourier-transformed into a spectral cube. Spectral band of interest **0.35–3.5 µm**.
 
 Optional motorized axes extend a single map into a series: a **Thorlabs delay
 stage** (Z) and a **Thorlabs rotation mount** (angle), both on KDC101 K-Cube
 controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
 
-> The camera talks GigE Vision through the **Pleora eBUS** .NET API (via
-> pythonnet). A synthetic **mock** camera lets the whole app run with no
+> A synthetic **mock** camera lets the whole app run with no
 > hardware — `--mode mock` needs nothing installed.
 
 ## Features
@@ -76,13 +75,15 @@ controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
 ## Layout
 
 ```
-gui/
-  main.py               entry point  (--mode irc806|mock|auto, --fps N)
+
+  main.py               entry point
   worker_camera.py      camera worker process (frames -> shared memory + queue)
   camera/               camera abstraction + backends
     camera_interface.py   CameraInterface ABC + CameraStatus/MeasurementResult
     irc806_camera.py      IRC806 backend (Pleora eBUS .NET via pythonnet)
     mock_camera.py        synthetic drifting-beam camera (no hardware)
+    hamamatsu_backend.py 
+    orca_camera.py
     factory.py            create_camera(mode)
   ui/
     main_window.py        orchestrator: live view, controls, background, ROI, save
@@ -109,11 +110,15 @@ walk-through of the architecture, and
 per-pixel continuum-subtraction method used to isolate the resonant line image.
 
 ## Setup (one time)
-
+Clone this branch folder. 
+Create virtual environment (midir) with the necessary libraries:
 ```bat
-cd gui
-py -3.12 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+cd MIDIRhyperspectralcamera
+conda create -n midir python=3.12
+conda activate midir
+conda install -c conda-forge pyqt        :: brings a self-consistent Qt6
+pip install pyqtgraph numpy scipy pandas pillow tifffile loguru cffi
+pip install "C:\your_Smaract_folder\smaract_ctl-1.6.2.zip"  :: change your_Smaract_folder with your directory for the smaract_ctl-1.6.2.zip filexx
 ```
 
 Python 3.8–3.12, 64-bit. `mock` mode needs only the pip packages. The real
@@ -122,6 +127,8 @@ hardware additionally needs, installed system-wide:
 - **Pleora eBUS runtime** — `C:\Program Files\Common Files\Pleora\eBUS SDK\PvDotNet.dll` (camera)
 - **Thorlabs Kinesis** — `C:\Program Files\Thorlabs\Kinesis` (delay stage + rotator, KDC101)
 - **SmarAct SCU3D** — `SCU3DControl.dll` (TWINS wedge)
+- **Hamamatsu Orca**
+- **Smaract MSC2** - 'C:\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip'
 
 ## Run
 
@@ -131,17 +138,8 @@ run.bat                                       REM main.py --mode irc806 --fps 12
 view.bat  path\to\cube.npz                    REM standalone cube viewer
 analyze.bat                                   REM standalone Z-series analyzer
 ```
+Alternative
 
-## Hardware notes
-
-- The camera is **single-access**: close eBUS Player first. After stopping, wait
-  ~10 s for the GigE heartbeat to clear before relaunching, and close the app
-  with its window **X** (force-killing can orphan the worker process).
-- The IRC806 `ExposureTime` node is in **seconds** with no valid firmware
-  min/max, so the UI hard-clamps integration to 0.01–8 ms (a huge value freezes
-  the stream). Frames are uint16 with **14-bit** data (saturation = 16383).
-- Both the delay stage and rotator use **KDC101** controllers, so each is pinned
-  to its serial to avoid grabbing the other's device. Assign the actuator
-  (Z825B / PRM1-Z8) to its controller in the Kinesis app first, or moves come out
-  in raw device units.
-- Camera IP is auto-discovered; no IP needs to be set.
+```bat
+python main.py --mode mock  :: python main.py if real camera is available for connection
+```
