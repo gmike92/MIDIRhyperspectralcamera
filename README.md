@@ -110,7 +110,8 @@ walk-through of the architecture, and
 per-pixel continuum-subtraction method used to isolate the resonant line image.
 
 ## Setup (one time)
-Create your virtual environment (midir) with the necessary libraries:
+Clone this branch folder. 
+Create virtual environment (midir) with the necessary libraries:
 ```bat
 cd MIDIRhyperspectralcamera
 conda create -n midir python=3.12
