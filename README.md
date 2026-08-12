@@ -127,6 +127,8 @@ hardware additionally needs, installed system-wide:
 - **Pleora eBUS runtime** — `C:\Program Files\Common Files\Pleora\eBUS SDK\PvDotNet.dll` (camera)
 - **Thorlabs Kinesis** — `C:\Program Files\Thorlabs\Kinesis` (delay stage + rotator, KDC101)
 - **SmarAct SCU3D** — `SCU3DControl.dll` (TWINS wedge)
+- **Hamamatsu Orca**
+- **Smaract MSC2** - 'C:\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip'
 
 ## Run
 
