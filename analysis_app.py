@@ -330,6 +330,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.bg_roi = None             # ROI whose average spectrum is subtracted
         self._bg_cube = None           # cached background-subtracted cube
         self._bg_sig = None            # signature of (cube, bg ROI) for that cache
+        self.ref_cube_full = None      # full-frame reference cube to divide by (nf,H,W)
+        self.ref_cube_wl = None        # the reference cube's wavelength axis (or None)
+        self.ref_cube_name = None      # basename of the loaded reference, for the label
+        self._ratio_cube = None        # cached sample / reference cube
+        self._ratio_sig = None         # signature of (cube, ref, ROI) for that cache
         self._z_axis = []              # sorted unique Z values across the loaded cubes
         self._a_axis = []              # sorted unique angle values
         self._grid = {}                # (z_index, angle_index) -> flat index into self.infos
@@ -437,6 +442,17 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         row.addWidget(QtWidgets.QLabel("λ:")); row.addWidget(self.wl_slider, 1); row.addWidget(self.lbl_wl)
         left.addLayout(row)
 
+        # Delay slider: scrubs the TEMPORAL hypercube (raw interferogram stack)
+        # frame by frame over the motor-position axis (mm) -- the OPD/time
+        # analogue of the λ slider. Only shown while Map = "Interferogram slice".
+        self.dlyrow = QtWidgets.QWidget(); dr = QtWidgets.QHBoxLayout(self.dlyrow); dr.setContentsMargins(0,0,0,0)
+        self.dly_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.dly_slider.valueChanged.connect(self._on_dly)
+        self.lbl_dly = QtWidgets.QLabel("-- mm"); self.lbl_dly.setStyleSheet("font-weight:600;")
+        dr.addWidget(QtWidgets.QLabel("Delay:")); dr.addWidget(self.dly_slider, 1); dr.addWidget(self.lbl_dly)
+        self.dlyrow.setVisible(False); left.addWidget(self.dlyrow)
+        self._dly_pos = None            # cached position axis for the delay label
+
         self.zrow = QtWidgets.QWidget(); zr = QtWidgets.QHBoxLayout(self.zrow); zr.setContentsMargins(0,0,0,0)
         self.z_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.z_slider.valueChanged.connect(self._on_selection_changed)
@@ -454,7 +470,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
         ctl = QtWidgets.QHBoxLayout()
         self.combo_map = QtWidgets.QComboBox()
-        self.combo_map.addItems(["λ slice", "Peak λ", "Peak intensity", "SAM", "RGB",
+        self.combo_map.addItems(["λ slice", "Interferogram slice", "Peak λ",
+                                 "Peak intensity", "SAM", "RGB",
                                  "K-means", "Continuum line"])
         self.combo_map.currentTextChanged.connect(self._on_map_changed)
         self.combo_cmap = QtWidgets.QComboBox()
@@ -586,6 +603,24 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         pr.addRow(self.chk_bg)
         pr.addRow(b_bg)
         pr.addRow(self.lbl_bg)
+
+        # --- Divide by a reference cube: sample / reference per pixel & band
+        #     (e.g. transmittance / reflectance). The reference must share the
+        #     spatial dimensions; a differing wavelength axis is interpolated onto
+        #     the current cube's axis before dividing. Affects every map + spectra.
+        self.chk_ratio = QtWidgets.QCheckBox("Divide by reference cube")
+        self.chk_ratio.setEnabled(False)          # enabled once a reference is loaded
+        self.chk_ratio.toggled.connect(self._on_ratio_toggled)
+        b_ratio = QtWidgets.QPushButton("Load reference cube…")
+        b_ratio.setToolTip("Pick an .npz hyperspectral cube of the same spatial size. "
+                           "Every pixel's spectrum is divided by the reference's; if the "
+                           "reference λ axis differs it is interpolated onto this one.")
+        b_ratio.clicked.connect(self._load_ratio_ref)
+        self.lbl_ratio = QtWidgets.QLabel("Reference cube: none")
+        self.lbl_ratio.setStyleSheet("color:#888;")
+        pr.addRow(self.chk_ratio)
+        pr.addRow(b_ratio)
+        pr.addRow(self.lbl_ratio)
 
         self.spin_clusters = QtWidgets.QSpinBox(); self.spin_clusters.setRange(2, 16)
         self.spin_clusters.setValue(4)
@@ -1038,6 +1073,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.work_roi.setVisible(True)         # full frame -> box for repositioning
         # region changed -> invalidate cube-shaped caches + local (per-frame) state
         self._cube_cache.clear(); self._bg_cube = None; self._bg_sig = None
+        self._ratio_cube = None; self._ratio_sig = None
         self.sel_pixels = []
         self._clear_rois_silent()
         self._kmeans_labels = None; self._cluster_key = None
@@ -1141,7 +1177,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         if wl is not None:
             self.wavelengths = wl
             self._sync_wl_slider(len(wl))
-        return self._apply_background(cube)
+        # sample / reference division first, then background subtraction on top.
+        return self._apply_background(self._apply_ratio(cube))
 
     def _apply_background(self, cube):
         """Subtract the chosen background ROI's average spectrum from every pixel.
@@ -1156,6 +1193,55 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._bg_cube = cube - np.asarray(bg, dtype=cube.dtype)[:, None, None]
             self._bg_sig = sig
         return self._bg_cube
+
+    def _apply_ratio(self, cube):
+        """Divide the cube by the loaded reference cube (sample / reference). The
+        reference is cropped to the current analysis ROI to match spatial dims,
+        and, when its wavelength axis differs, interpolated onto the current axis
+        before dividing. Zero / near-zero reference pixels become NaN (they can't
+        be divided). Cached by (cube, reference, ROI) so it recomputes only when
+        one of those changes."""
+        if (cube is None or not self.chk_ratio.isChecked()
+                or self.ref_cube_full is None):
+            return cube
+        # Spatial match: crop the FULL-frame reference to the same analysis ROI.
+        ref = self._work_crop3(self.ref_cube_full)
+        if ref.shape[1:] != cube.shape[1:]:
+            # Safety net (e.g. a different-sized dataset was loaded while a
+            # reference was active): hard error + turn the division off so it
+            # fires once, not on every refresh.
+            self.chk_ratio.blockSignals(True); self.chk_ratio.setChecked(False)
+            self.chk_ratio.blockSignals(False)
+            self._ratio_error(ref.shape[1:], cube.shape[1:])
+            return cube
+        roi_sig = (str(self.work_roi.saveState()) if self.work_roi else None,
+                   bool(self.chk_work.isChecked()))
+        sig = (id(cube), id(self.ref_cube_full), roi_sig)
+        if self._ratio_sig == sig and self._ratio_cube is not None:
+            return self._ratio_cube
+        wl = np.asarray(self.wavelengths, float) if self.wavelengths is not None else None
+        rwl = None if self.ref_cube_wl is None else np.asarray(self.ref_cube_wl, float)
+        # Interpolate the reference onto the current λ axis when the axes differ.
+        if wl is not None and rwl is not None and (
+                len(rwl) != len(wl) or not np.allclose(rwl, wl)):
+            try:
+                from scipy.interpolate import interp1d
+                ref = interp1d(rwl, ref, axis=0, kind="linear", bounds_error=False,
+                               fill_value=np.nan, assume_sorted=False)(wl).astype(np.float32)
+            except Exception as e:  # noqa: BLE001
+                self.statusBar().showMessage(f"reference interpolation failed: {e}")
+                return cube
+        elif ref.shape[0] != cube.shape[0]:
+            self.statusBar().showMessage(
+                f"Reference has {ref.shape[0]} bands vs {cube.shape[0]} and no λ axis "
+                "to interpolate — division skipped.")
+            return cube
+        absref = np.abs(ref)
+        eps = max(1e-12, 1e-6 * float(np.nanmax(absref))) if absref.size else 1e-12
+        safe = np.where(absref < eps, np.nan, ref)
+        self._ratio_cube = (cube / safe).astype(np.float32)
+        self._ratio_sig = sig
+        return self._ratio_cube
 
     # -- raw interferogram + recompute ---------------------------------------
     def current_interferogram(self):
@@ -1452,8 +1538,40 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
     def _on_map_changed(self, *a):
         # Switching map mode refreshes both the image and the spectra panel (so
         # e.g. the per-cluster spectra / continuum bands appear with their map).
+        # The delay-position slider is only relevant to the interferogram slice.
+        is_ifg = self.combo_map.currentText() == "Interferogram slice"
+        self.dlyrow.setVisible(is_ifg)
+        if is_ifg:
+            self._sync_dly_slider()
         self.refresh_map()
         self.update_spectra()
+
+    def _sync_dly_slider(self):
+        """Bound the delay slider to the current interferogram's position count
+        and refresh its label. No-op-safe when the file has no raw stack."""
+        pos, raw = self.current_interferogram()
+        n = 0 if raw is None else raw.shape[0]
+        self._dly_pos = pos
+        self.dly_slider.blockSignals(True)
+        self.dly_slider.setMinimum(0)
+        self.dly_slider.setMaximum(max(0, n - 1))
+        if not (0 <= self.dly_slider.value() <= max(0, n - 1)):
+            self.dly_slider.setValue(n // 2)
+        self.dly_slider.blockSignals(False)
+        self._update_dly_label()
+
+    def _update_dly_label(self):
+        pos = self._dly_pos
+        if pos is None or not len(pos):
+            self.lbl_dly.setText("-- mm"); return
+        i = int(np.clip(self.dly_slider.value(), 0, len(pos) - 1))
+        cal = "cal" if self.current_positions_calibrated() else "raw"
+        self.lbl_dly.setText(f"{float(np.asarray(pos)[i]):.4f} mm  [{cal}]")
+
+    def _on_dly(self, *a):
+        # Instant label; debounce the (cheap) frame swap so a drag stays smooth.
+        self._update_dly_label()
+        self._wl_timer.start(_WL_DEBOUNCE_MS)
 
     def _continuum_bands(self):
         """(line, left_shoulder, right_shoulder) wavelength bands, each (lo, hi)."""
@@ -1493,6 +1611,30 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         if mode == "λ slice":
             i = min(max(self.wl_slider.value(), 0), cube.shape[0] - 1)
             self._set_map_image(self._gamma(cube[i], gamma))
+        elif mode == "Interferogram slice":
+            # Scrub the raw temporal hypercube: one XY frame at the selected motor
+            # position. Uses the SAME ROI-cropped raw as the phase/recompute paths.
+            pos, raw = self.current_interferogram()
+            if raw is None or pos is None:
+                self.iv.clear()
+                self.statusBar().showMessage(
+                    "This file has no stored raw interferogram — nothing to scrub.")
+                self.lbl_wl.setText("[no raw]")
+                return
+            n = raw.shape[0]
+            if self.dly_slider.maximum() != n - 1:      # keep bounds in step
+                self.dly_slider.blockSignals(True)
+                self.dly_slider.setMaximum(max(0, n - 1))
+                if self.dly_slider.value() > n - 1:
+                    self.dly_slider.setValue(n // 2)
+                self.dly_slider.blockSignals(False)
+            self._dly_pos = pos
+            i = int(np.clip(self.dly_slider.value(), 0, n - 1))
+            self._set_map_image(self._gamma(raw[i], gamma))
+            self._update_dly_label()
+            self.iv.ui.roiPlot.hide()
+            self.lbl_wl.setText(f"[frame {i+1}/{n}]")
+            return
         elif mode == "Peak λ":
             self._set_map_image(A.peak_wavelength_map(ccube, cwl))
         elif mode == "Peak intensity":
@@ -1558,6 +1700,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             img = A.peak_intensity_map(ccube)
         elif mode == "Peak λ":
             img = A.peak_wavelength_map(ccube, cwl)
+        elif mode == "Interferogram slice":
+            _pos, raw = self.current_interferogram()
+            if raw is None:
+                return
+            img = raw[int(np.clip(self.dly_slider.value(), 0, raw.shape[0] - 1))]
         else:
             img = cube[min(self.wl_slider.value(), cube.shape[0] - 1)]
         lo, hi = float(np.nanmin(img)), float(np.nanmax(img))
@@ -1705,7 +1852,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._wl_timer.start(_WL_DEBOUNCE_MS)
 
     def _do_wl_refresh(self):
-        if self.combo_map.currentText() == "λ slice":
+        if self.combo_map.currentText() in ("λ slice", "Interferogram slice"):
             self.refresh_map()
         self._update_phase()
 
@@ -2071,6 +2218,58 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     def _on_bg_toggled(self, *a):
         self._bg_sig = None             # force re-evaluation (no expensive reload)
+        self.refresh_map(); self.update_spectra()
+
+    def _load_ratio_ref(self):
+        """Load an .npz hyperspectral cube to divide the current cube by
+        (sample / reference). Enables the division automatically."""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Reference hyperspectral cube (.npz)", "",
+            "NumPy cube (*.npz);;All files (*)")
+        if not path:
+            return
+        try:
+            cube = _load_cube(path)
+            if cube is None:
+                raise ValueError("no spectrum_cube / spectrum_cubes in this file")
+            with np.load(path, allow_pickle=True) as d:
+                wl = np.asarray(d["wavelengths"], float) if "wavelengths" in d.files else None
+        except Exception as e:  # noqa: BLE001
+            self.statusBar().showMessage(f"could not read reference cube: {e}")
+            return
+        nf, h, w = np.asarray(cube).shape
+        # Reject a spatially-mismatched reference outright (no auto-align).
+        full = self._full_hw
+        if full is not None and (h, w) != tuple(full):
+            self._ratio_error((h, w), tuple(full))
+            self.lbl_ratio.setText(
+                f"Reference cube: {os.path.basename(path)} — REJECTED "
+                f"({h}×{w}, data is {full[0]}×{full[1]})")
+            self.lbl_ratio.setStyleSheet("color:#e03131; font-weight:600;")
+            return
+        self.ref_cube_full = np.asarray(cube, np.float32)
+        self.ref_cube_wl = wl
+        self.ref_cube_name = os.path.basename(path)
+        self._ratio_sig = None                    # force recompute against the new ref
+        axis = "no λ axis" if wl is None else f"{wl.min():.3f}–{wl.max():.3f} µm, {nf} bands"
+        self.lbl_ratio.setText(f"Reference cube: {self.ref_cube_name}  ({h}×{w}, {axis})")
+        self.lbl_ratio.setStyleSheet("color:#888;")
+        self.chk_ratio.setEnabled(True)
+        # Turn the division on (blockSignals so we refresh exactly once below).
+        self.chk_ratio.blockSignals(True); self.chk_ratio.setChecked(True)
+        self.chk_ratio.blockSignals(False)
+        self.refresh_map(); self.update_spectra()
+
+    def _ratio_error(self, ref_hw, data_hw):
+        """Show a modal error for a reference/data spatial-dimension mismatch."""
+        QtWidgets.QMessageBox.critical(
+            self, "Reference dimension mismatch",
+            f"The reference cube is {ref_hw[0]}×{ref_hw[1]} but the loaded data is "
+            f"{data_hw[0]}×{data_hw[1]}.\n\nThey must have the same spatial dimensions "
+            "to divide — load a reference of the same size.")
+
+    def _on_ratio_toggled(self, *a):
+        self._ratio_sig = None          # force re-evaluation (base cube stays cached)
         self.refresh_map(); self.update_spectra()
 
     def set_reference(self):
