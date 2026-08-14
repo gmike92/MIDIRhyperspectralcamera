@@ -437,6 +437,17 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         row.addWidget(QtWidgets.QLabel("λ:")); row.addWidget(self.wl_slider, 1); row.addWidget(self.lbl_wl)
         left.addLayout(row)
 
+        # Delay slider: scrubs the TEMPORAL hypercube (raw interferogram stack)
+        # frame by frame over the motor-position axis (mm) -- the OPD/time
+        # analogue of the λ slider. Only shown while Map = "Interferogram slice".
+        self.dlyrow = QtWidgets.QWidget(); dr = QtWidgets.QHBoxLayout(self.dlyrow); dr.setContentsMargins(0,0,0,0)
+        self.dly_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.dly_slider.valueChanged.connect(self._on_dly)
+        self.lbl_dly = QtWidgets.QLabel("-- mm"); self.lbl_dly.setStyleSheet("font-weight:600;")
+        dr.addWidget(QtWidgets.QLabel("Delay:")); dr.addWidget(self.dly_slider, 1); dr.addWidget(self.lbl_dly)
+        self.dlyrow.setVisible(False); left.addWidget(self.dlyrow)
+        self._dly_pos = None            # cached position axis for the delay label
+
         self.zrow = QtWidgets.QWidget(); zr = QtWidgets.QHBoxLayout(self.zrow); zr.setContentsMargins(0,0,0,0)
         self.z_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.z_slider.valueChanged.connect(self._on_selection_changed)
@@ -454,7 +465,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
         ctl = QtWidgets.QHBoxLayout()
         self.combo_map = QtWidgets.QComboBox()
-        self.combo_map.addItems(["λ slice", "Peak λ", "Peak intensity", "SAM", "RGB",
+        self.combo_map.addItems(["λ slice", "Interferogram slice", "Peak λ",
+                                 "Peak intensity", "SAM", "RGB",
                                  "K-means", "Continuum line"])
         self.combo_map.currentTextChanged.connect(self._on_map_changed)
         self.combo_cmap = QtWidgets.QComboBox()
@@ -1452,8 +1464,40 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
     def _on_map_changed(self, *a):
         # Switching map mode refreshes both the image and the spectra panel (so
         # e.g. the per-cluster spectra / continuum bands appear with their map).
+        # The delay-position slider is only relevant to the interferogram slice.
+        is_ifg = self.combo_map.currentText() == "Interferogram slice"
+        self.dlyrow.setVisible(is_ifg)
+        if is_ifg:
+            self._sync_dly_slider()
         self.refresh_map()
         self.update_spectra()
+
+    def _sync_dly_slider(self):
+        """Bound the delay slider to the current interferogram's position count
+        and refresh its label. No-op-safe when the file has no raw stack."""
+        pos, raw = self.current_interferogram()
+        n = 0 if raw is None else raw.shape[0]
+        self._dly_pos = pos
+        self.dly_slider.blockSignals(True)
+        self.dly_slider.setMinimum(0)
+        self.dly_slider.setMaximum(max(0, n - 1))
+        if not (0 <= self.dly_slider.value() <= max(0, n - 1)):
+            self.dly_slider.setValue(n // 2)
+        self.dly_slider.blockSignals(False)
+        self._update_dly_label()
+
+    def _update_dly_label(self):
+        pos = self._dly_pos
+        if pos is None or not len(pos):
+            self.lbl_dly.setText("-- mm"); return
+        i = int(np.clip(self.dly_slider.value(), 0, len(pos) - 1))
+        cal = "cal" if self.current_positions_calibrated() else "raw"
+        self.lbl_dly.setText(f"{float(np.asarray(pos)[i]):.4f} mm  [{cal}]")
+
+    def _on_dly(self, *a):
+        # Instant label; debounce the (cheap) frame swap so a drag stays smooth.
+        self._update_dly_label()
+        self._wl_timer.start(_WL_DEBOUNCE_MS)
 
     def _continuum_bands(self):
         """(line, left_shoulder, right_shoulder) wavelength bands, each (lo, hi)."""
@@ -1493,6 +1537,30 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         if mode == "λ slice":
             i = min(max(self.wl_slider.value(), 0), cube.shape[0] - 1)
             self._set_map_image(self._gamma(cube[i], gamma))
+        elif mode == "Interferogram slice":
+            # Scrub the raw temporal hypercube: one XY frame at the selected motor
+            # position. Uses the SAME ROI-cropped raw as the phase/recompute paths.
+            pos, raw = self.current_interferogram()
+            if raw is None or pos is None:
+                self.iv.clear()
+                self.statusBar().showMessage(
+                    "This file has no stored raw interferogram — nothing to scrub.")
+                self.lbl_wl.setText("[no raw]")
+                return
+            n = raw.shape[0]
+            if self.dly_slider.maximum() != n - 1:      # keep bounds in step
+                self.dly_slider.blockSignals(True)
+                self.dly_slider.setMaximum(max(0, n - 1))
+                if self.dly_slider.value() > n - 1:
+                    self.dly_slider.setValue(n // 2)
+                self.dly_slider.blockSignals(False)
+            self._dly_pos = pos
+            i = int(np.clip(self.dly_slider.value(), 0, n - 1))
+            self._set_map_image(self._gamma(raw[i], gamma))
+            self._update_dly_label()
+            self.iv.ui.roiPlot.hide()
+            self.lbl_wl.setText(f"[frame {i+1}/{n}]")
+            return
         elif mode == "Peak λ":
             self._set_map_image(A.peak_wavelength_map(ccube, cwl))
         elif mode == "Peak intensity":
@@ -1558,6 +1626,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             img = A.peak_intensity_map(ccube)
         elif mode == "Peak λ":
             img = A.peak_wavelength_map(ccube, cwl)
+        elif mode == "Interferogram slice":
+            _pos, raw = self.current_interferogram()
+            if raw is None:
+                return
+            img = raw[int(np.clip(self.dly_slider.value(), 0, raw.shape[0] - 1))]
         else:
             img = cube[min(self.wl_slider.value(), cube.shape[0] - 1)]
         lo, hi = float(np.nanmin(img)), float(np.nanmax(img))
@@ -1705,7 +1778,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._wl_timer.start(_WL_DEBOUNCE_MS)
 
     def _do_wl_refresh(self):
-        if self.combo_map.currentText() == "λ slice":
+        if self.combo_map.currentText() in ("λ slice", "Interferogram slice"):
             self.refresh_map()
         self._update_phase()
 
