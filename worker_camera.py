@@ -156,6 +156,11 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                         camera.set_average(int(command.get("value", 1)))
                     publish_status(frame_queue, camera.get_status())
                     continue
+                if cmd_type == "set_option":
+                    if hasattr(camera, "set_option"):
+                        camera.set_option(command.get("name"), command.get("value"))
+                    publish_status(frame_queue, camera.get_status())
+                    continue
                 if cmd_type == "start":
                     camera.start_acquisition()
                     should_stream = True
@@ -171,6 +176,17 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                     connect_camera(command.get("mode", mode))
                     should_stream = camera is not None and camera.status.acquiring
                     last_frame_time = time.time()
+                    continue
+                if cmd_type == "disconnect":
+                    # Manual disconnect: stop the stream + release the device and
+                    # STAY offline (should_stream=False disables auto-reconnect) so
+                    # a split/desynced stream can be cleanly re-established on the
+                    # user's next Connect / Reconnect.
+                    if camera is not None:
+                        camera.stop_acquisition()
+                        camera.disconnect()
+                        publish_status(frame_queue, camera.get_status())
+                    should_stream = False
                     continue
                 if cmd_type == "read_temp":
                     if hasattr(camera, "refresh_temperatures"):

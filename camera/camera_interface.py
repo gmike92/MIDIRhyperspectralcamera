@@ -73,6 +73,9 @@ class CameraInterface(ABC):
     def set_average(self, average_count: int) -> None:
         """Update the averaging count if supported."""
 
+    def set_option(self, name: str, value) -> None:
+        """Set a named camera option (e.g. GenICam node). No-op if unsupported."""
+
     @abstractmethod
     def get_status(self) -> CameraStatus:
         """Return the latest backend status."""

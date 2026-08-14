@@ -66,6 +66,15 @@ class MainWindow(QMainWindow):
         self._bg_accum = None            # accumulator during capture
         self.bg_average_frames = 16      # frames averaged for a background
         self.latest_frame = None
+        # Bad-pixel (cold/hot) mask: masked pixels are replaced by their nearest
+        # good neighbour BEFORE latest_frame is set, so they are neither plotted
+        # nor saved (the scan reads latest_frame). Precomputed index maps make the
+        # per-frame fix O(n_bad).
+        self.bad_pixel_mask = None          # bool (H, W)
+        self.badpix_enabled = False
+        self._badpix_bad = None             # (yy, xx) of masked pixels
+        self._badpix_src = None             # (yy, xx) of their nearest good pixel
+        self.mask_paint_mode = "none"       # "none" | "add" | "erase"
         self.latest_status = {}        # most recent camera status (for metadata)
         self.last_display_frame = None
         self._display_levels = (0.0, 16383.0)
@@ -97,6 +106,7 @@ class MainWindow(QMainWindow):
         controls_tabs.setMaximumWidth(340)
         controls_tabs.addTab(self._make_tab([
             self._build_camera_group(),
+            self._build_badpixel_group(),
             self._build_processing_group(),
             self._build_correction_group(),
             self._build_save_group(),
@@ -256,6 +266,169 @@ class MainWindow(QMainWindow):
         scroll.setWidget(container)
         return scroll
 
+    def _build_badpixel_group(self) -> QGroupBox:
+        group = QGroupBox("Bad pixels (cold/hot)")
+        v = QVBoxLayout(group)
+        self.badpix_check = QCheckBox("Apply mask (masked pixels not plotted/saved)")
+        self.badpix_check.toggled.connect(self._on_badpix_enabled)
+        v.addWidget(self.badpix_check)
+        self.badpix_count_label = QLabel("Masked: 0 px")
+        v.addWidget(self.badpix_count_label)
+
+        det_row = QHBoxLayout()
+        self.badpix_detect_btn = QPushButton("Auto-detect hot/cold")
+        self.badpix_detect_btn.setToolTip(
+            "Flag pixels that deviate from a 3x3 median by more than N-sigma "
+            "(robust MAD) -- catches stuck-hot and dead-cold pixels -- and add "
+            "them to the mask.")
+        self.badpix_detect_btn.clicked.connect(self._detect_bad_pixels)
+        det_row.addWidget(self.badpix_detect_btn)
+        self.badpix_sigma_spin = QDoubleSpinBox()
+        self.badpix_sigma_spin.setRange(2.0, 30.0)
+        self.badpix_sigma_spin.setSingleStep(0.5)
+        self.badpix_sigma_spin.setValue(6.0)
+        self.badpix_sigma_spin.setPrefix("σ ")
+        det_row.addWidget(self.badpix_sigma_spin)
+        v.addLayout(det_row)
+
+        paint_row = QHBoxLayout()
+        self.badpix_paint_btn = QPushButton("Paint")
+        self.badpix_paint_btn.setCheckable(True)
+        self.badpix_paint_btn.setToolTip("Click pixels on the image to MASK them.")
+        self.badpix_erase_btn = QPushButton("Erase")
+        self.badpix_erase_btn.setCheckable(True)
+        self.badpix_erase_btn.setToolTip("Click pixels on the image to UNMASK them.")
+        self.badpix_paint_btn.clicked.connect(
+            lambda on: self._set_paint_mode("add" if on else "none"))
+        self.badpix_erase_btn.clicked.connect(
+            lambda on: self._set_paint_mode("erase" if on else "none"))
+        paint_row.addWidget(self.badpix_paint_btn)
+        paint_row.addWidget(self.badpix_erase_btn)
+        paint_row.addWidget(QLabel("Brush (px)"))
+        self.badpix_brush_spin = QSpinBox()
+        self.badpix_brush_spin.setRange(0, 25)
+        self.badpix_brush_spin.setValue(0)
+        paint_row.addWidget(self.badpix_brush_spin)
+        v.addLayout(paint_row)
+
+        file_row = QHBoxLayout()
+        for label, slot in (("Clear", self._clear_badpix),
+                            ("Save", self._save_badpix), ("Load", self._load_badpix)):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            file_row.addWidget(b)
+        v.addLayout(file_row)
+        return group
+
+    # -- bad-pixel mask logic ------------------------------------------------
+    def _badpix_ensure_shape(self, shape) -> None:
+        if self.bad_pixel_mask is None or self.bad_pixel_mask.shape != shape:
+            self.bad_pixel_mask = np.zeros(shape, dtype=bool)
+
+    def _rebuild_badpix_map(self) -> None:
+        """Precompute, for each masked pixel, the nearest GOOD pixel to copy from."""
+        m = self.bad_pixel_mask
+        if m is None or not m.any() or m.all():
+            self._badpix_bad = self._badpix_src = None
+        else:
+            from scipy.ndimage import distance_transform_edt
+            inds = distance_transform_edt(m, return_distances=False, return_indices=True)
+            bad = np.where(m)
+            self._badpix_bad = bad
+            self._badpix_src = (inds[0][bad], inds[1][bad])
+        if hasattr(self, "badpix_count_label"):
+            n = int(m.sum()) if m is not None else 0
+            self.badpix_count_label.setText(f"Masked: {n} px")
+
+    def _correct_bad_pixels(self, frame: np.ndarray) -> np.ndarray:
+        if (not self.badpix_enabled or self._badpix_bad is None
+                or self.bad_pixel_mask is None
+                or self.bad_pixel_mask.shape != frame.shape):
+            return frame
+        out = frame.copy()
+        out[self._badpix_bad] = frame[self._badpix_src]
+        return out
+
+    def _on_badpix_enabled(self, on: bool) -> None:
+        self.badpix_enabled = bool(on)
+        self.status_label.setText(
+            f"bad-pixel mask {'ON' if on else 'off'}")
+
+    def _detect_bad_pixels(self) -> None:
+        f = self.latest_frame
+        if f is None:
+            self.status_label.setText("no frame to detect bad pixels")
+            return
+        from scipy.ndimage import median_filter
+        ff = np.asarray(f, dtype=np.float32)
+        diff = ff - median_filter(ff, size=3)
+        mad = float(np.median(np.abs(diff - np.median(diff)))) + 1e-6
+        thr = float(self.badpix_sigma_spin.value()) * 1.4826 * mad
+        new = np.abs(diff) > thr
+        self._badpix_ensure_shape(ff.shape)
+        added = int((new & ~self.bad_pixel_mask).sum())
+        self.bad_pixel_mask |= new
+        self._rebuild_badpix_map()
+        if not self.badpix_check.isChecked():
+            self.badpix_check.setChecked(True)    # auto-enable so it takes effect
+        self.status_label.setText(f"detected {added} new bad pixel(s)")
+
+    def _paint_mask(self, row: int, col: int) -> None:
+        if self.latest_frame is None:
+            return
+        self._badpix_ensure_shape(self.latest_frame.shape)
+        r = int(self.badpix_brush_spin.value())
+        add = self.mask_paint_mode == "add"
+        if r <= 0:
+            self.bad_pixel_mask[row, col] = add
+        else:
+            h, w = self.bad_pixel_mask.shape
+            yy, xx = np.ogrid[:h, :w]
+            self.bad_pixel_mask[(xx - col) ** 2 + (yy - row) ** 2 <= r * r] = add
+        self._rebuild_badpix_map()
+        if add and not self.badpix_check.isChecked():
+            self.badpix_check.setChecked(True)
+
+    def _set_paint_mode(self, mode: str) -> None:
+        self.mask_paint_mode = mode
+        self.badpix_paint_btn.setChecked(mode == "add")
+        self.badpix_erase_btn.setChecked(mode == "erase")
+
+    def _clear_badpix(self, *_a) -> None:
+        if self.bad_pixel_mask is not None:
+            self.bad_pixel_mask[:] = False
+        self._rebuild_badpix_map()
+        self.status_label.setText("bad-pixel mask cleared")
+
+    def _save_badpix(self, *_a) -> None:
+        if self.bad_pixel_mask is None or not self.bad_pixel_mask.any():
+            self.status_label.setText("no bad-pixel mask to save")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save bad-pixel mask", "bad_pixels.npy", "NumPy mask (*.npy)")
+        if path:
+            np.save(path, self.bad_pixel_mask.astype(np.uint8))
+            self.status_label.setText(f"saved mask: {os.path.basename(path)}")
+
+    def _load_badpix(self, *_a) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load bad-pixel mask", "", "NumPy mask (*.npy)")
+        if not path:
+            return
+        try:
+            m = np.load(path).astype(bool)
+        except Exception as e:  # noqa: BLE001
+            self.status_label.setText(f"mask load failed: {e}")
+            return
+        if m.ndim != 2:
+            self.status_label.setText("mask file is not 2D")
+            return
+        self.bad_pixel_mask = m
+        self._rebuild_badpix_map()
+        self.badpix_check.setChecked(True)
+        self.status_label.setText(
+            f"loaded mask: {os.path.basename(path)} ({int(m.sum())} px)")
+
     def _build_camera_group(self) -> QGroupBox:
         group = QGroupBox("Camera")
         layout = QVBoxLayout(group)
@@ -271,27 +444,28 @@ class MainWindow(QMainWindow):
             layout.addWidget(_w)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["irc806", "mock", "auto"])
+        self.mode_combo.addItems(["irc806", "ophir", "mock", "auto"])
         self.mode_combo.setCurrentText(self.current_mode)
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)
 
-        # Integration time. IRC806 ExposureTime max is ~1 frame time (8 ms at
-        # 120 Hz); cap the UI so a stream-freezing value can't be requested.
+        # Integration time. LOG-scale slider spanning the full range (1 us .. 1 s)
+        # so both very short and long integrations are reachable; the spin box
+        # gives exact entry. The backend clamps to what the camera accepts.
+        self.INT_MIN_MS, self.INT_MAX_MS = 0.001, 1000.0
         self.integration_label = QLabel("Integration time: 0.30 ms")
         self.integration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.integration_slider.setRange(1, 800)   # x0.01 ms -> 0.01..8.00 ms
-        self.integration_slider.setValue(30)       # 0.30 ms start
+        self.integration_slider.setRange(0, 1000)   # log-mapped to INT_MIN..MAX ms
         self.integration_slider.valueChanged.connect(self.on_integration_slider_changed)
         self.integration_spin = QDoubleSpinBox()
-        self.integration_spin.setDecimals(2)
-        self.integration_spin.setRange(0.01, 8.0)
+        self.integration_spin.setDecimals(3)
+        self.integration_spin.setRange(self.INT_MIN_MS, self.INT_MAX_MS)
         self.integration_spin.setSingleStep(0.05)
-        self.integration_spin.setValue(0.3)
         self.integration_spin.valueChanged.connect(self.on_integration_spin_changed)
         layout.addWidget(self.integration_label)
         layout.addWidget(self.integration_slider)
         layout.addWidget(self.integration_spin)
+        self._set_integration_value(0.3, emit=False)   # sync both widgets
 
         self.average_spin = QSpinBox()
         self.average_spin.setRange(1, 256)
@@ -299,6 +473,38 @@ class MainWindow(QMainWindow):
         self.average_spin.valueChanged.connect(self.on_average_changed)
         layout.addWidget(QLabel("Averaging"))
         layout.addWidget(self.average_spin)
+
+        # -- SP1203 / Goldeye GenICam options (no-ops on the IRC806) ----------
+        layout.addWidget(QLabel("— SP1203 / Goldeye options —"))
+        self.opt_combos = {}
+        for label, node, options in (
+            ("Integration mode", "IntegrationMode",
+             ["IntegrateThenRead", "IntegrateWhileRead"]),
+            ("Auto exposure", "ExposureAuto", ["Off", "Once", "Continuous"]),
+            ("Sensor gain", "SensorGain", ["Gain0", "Gain1", "Gain2"]),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            cb = QComboBox()
+            cb.addItems(options)
+            cb.currentTextChanged.connect(
+                lambda val, n=node: self.control_queue.put(
+                    {"type": "set_option", "name": n, "value": val}))
+            row.addWidget(cb)
+            layout.addLayout(row)
+            self.opt_combos[node] = cb
+
+        fr_row = QHBoxLayout()
+        fr_row.addWidget(QLabel("Frame rate (Hz)"))
+        self.framerate_spin = QDoubleSpinBox()
+        self.framerate_spin.setRange(0.03, 231.0)
+        self.framerate_spin.setDecimals(2)
+        self.framerate_spin.setValue(30.0)
+        self.framerate_spin.valueChanged.connect(
+            lambda v: self.control_queue.put(
+                {"type": "set_option", "name": "AcquisitionFrameRate", "value": float(v)}))
+        fr_row.addWidget(self.framerate_spin)
+        layout.addLayout(fr_row)
 
         start_button = QPushButton("Start")
         start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
@@ -308,10 +514,17 @@ class MainWindow(QMainWindow):
         snapshot_button.clicked.connect(lambda: self.control_queue.put({"type": "snapshot"}))
         connect_button = QPushButton("Connect / Reconnect")
         connect_button.clicked.connect(self.connect_selected_mode)
+        disconnect_button = QPushButton("Disconnect")
+        disconnect_button.setToolTip(
+            "Stop the stream and release the camera, staying offline (no "
+            "auto-reconnect). Use this if the image splits / shows wrong pixels "
+            "(GigE stream desync), then click Connect / Reconnect to recover.")
+        disconnect_button.clicked.connect(self.disconnect_camera)
         top_buttons = QHBoxLayout()
         top_buttons.addWidget(connect_button)
         top_buttons.addWidget(start_button)
         bottom_buttons = QHBoxLayout()
+        bottom_buttons.addWidget(disconnect_button)
         bottom_buttons.addWidget(pause_button)
         bottom_buttons.addWidget(snapshot_button)
         layout.addLayout(top_buttons)
@@ -556,11 +769,19 @@ class MainWindow(QMainWindow):
 
         return group
 
-    def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
-        integration_ms = float(np.clip(integration_ms, 0.01, 8.0))
-        self.integration_label.setText(f"Integration time: {integration_ms:.2f} ms")
+    def _ms_to_slider(self, ms: float) -> int:
+        ms = float(np.clip(ms, self.INT_MIN_MS, self.INT_MAX_MS))
+        frac = np.log10(ms / self.INT_MIN_MS) / np.log10(self.INT_MAX_MS / self.INT_MIN_MS)
+        return int(round(frac * 1000.0))
 
-        slider_value = int(round(integration_ms * 100.0))
+    def _slider_to_ms(self, s: int) -> float:
+        return float(self.INT_MIN_MS * (self.INT_MAX_MS / self.INT_MIN_MS) ** (s / 1000.0))
+
+    def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
+        integration_ms = float(np.clip(integration_ms, self.INT_MIN_MS, self.INT_MAX_MS))
+        self.integration_label.setText(f"Integration time: {integration_ms:.3f} ms")
+
+        slider_value = self._ms_to_slider(integration_ms)
         if self.integration_slider.value() != slider_value:
             self.integration_slider.blockSignals(True)
             self.integration_slider.setValue(slider_value)
@@ -575,7 +796,7 @@ class MainWindow(QMainWindow):
             self.control_queue.put({"type": "set_exposure", "value": integration_ms})
 
     def on_integration_slider_changed(self, value: int) -> None:
-        self._set_integration_value(value / 100.0, emit=True)
+        self._set_integration_value(self._slider_to_ms(value), emit=True)
 
     def on_integration_spin_changed(self, value: float) -> None:
         self._set_integration_value(value, emit=True)
@@ -587,6 +808,12 @@ class MainWindow(QMainWindow):
         self.current_mode = self.mode_combo.currentText()
         self.status_label.setText(f"Connecting using {self.current_mode} mode...")
         self.control_queue.put({"type": "connect", "mode": self.current_mode})
+
+    def disconnect_camera(self) -> None:
+        """Manually drop the camera and stay offline (no auto-reconnect) until the
+        user hits Connect / Reconnect -- for recovering a split/desynced stream."""
+        self.status_label.setText("Disconnecting camera...")
+        self.control_queue.put({"type": "disconnect"})
 
     def capture_background(self, *_args) -> None:
         """Average the next N incoming frames into the background reference."""
@@ -641,6 +868,11 @@ class MainWindow(QMainWindow):
         row = int(np.floor(image_pos.y()))
         height, width = self.latest_frame.shape
         if col < 0 or row < 0 or col >= width or row >= height:
+            return
+        # In paint/erase mode a click edits the bad-pixel mask instead of moving
+        # the profile cursor (brush radius = the "Brush (px)" spin).
+        if self.mask_paint_mode != "none":
+            self._paint_mask(row, col)
             return
         self.profile_pixel = (row, col)
         self._update_crosshair()
@@ -908,6 +1140,9 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Camera is {state}, {acquisition}. {status.get('message', '')}")
 
     def _apply_frame(self, frame: np.ndarray, measurement: dict) -> None:
+        # Replace masked cold/hot pixels with their nearest good neighbour so they
+        # are neither displayed nor saved (both paths read latest_frame).
+        frame = self._correct_bad_pixels(frame)
         self.latest_frame = frame
 
         # Background capture: average N incoming frames into background_frame.

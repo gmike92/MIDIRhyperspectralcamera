@@ -128,7 +128,9 @@ class StagesPanel(QWidget):
         go = QHBoxLayout()
         go.addWidget(QLabel("Go to"))
         self.d_goto = QDoubleSpinBox()
-        self.d_goto.setRange(0.0, 300.0)
+        # Allow negative absolute targets (LTS300 reconfigured for a negative
+        # coordinate range). The controller still enforces its own soft limits.
+        self.d_goto.setRange(-300.0, 300.0)
         self.d_goto.setDecimals(4)
         self.d_goto.setSingleStep(0.1)
         self.d_goto.setSuffix(" mm")

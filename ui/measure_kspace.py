@@ -804,28 +804,28 @@ class MeasurePanel(QWidget):
         return g
 
     def _zone_points(self, zr) -> list:
-        """Evenly-spaced Z positions (mm) for one zone row (endpoints inclusive)."""
-        lo, hi = zr["z0"].value(), zr["z1"].value()
-        if hi < lo:
-            lo, hi = hi, lo
-        if hi <= lo:
-            return [lo]
+        """Evenly-spaced Z positions (mm) for one zone row, in the ENTERED
+        Start->Stop direction (endpoints inclusive). If Start > Stop the points
+        DESCEND, so the Z-scan starts at Start and steps NEGATIVE -- the LTS300
+        workflow (start at a chosen Z, step down)."""
+        start, stop = zr["z0"].value(), zr["z1"].value()
+        if abs(stop - start) < 1e-9:
+            return [start]
         step_mm = max(zr["step"].value() / 1000.0, 1e-6)
-        n = int(round((hi - lo) / step_mm)) + 1
-        return list(np.linspace(lo, hi, max(n, 2)))
+        n = int(round(abs(stop - start) / step_mm)) + 1
+        return list(np.linspace(start, stop, max(n, 2)))
 
     def _zone_targets(self) -> list:
-        """Sorted, de-duplicated Z positions (mm) from all ENABLED zones."""
+        """Z positions (mm) from all ENABLED zones, kept in the entered scan
+        direction (NOT sorted) so a Start>Stop zone steps negative. Consecutive
+        near-duplicates (<0.5 µm) are merged to avoid re-visiting a point."""
         pts = []
         for zr in self.zone_rows:
             if zr["chk"].isChecked():
                 pts.extend(self._zone_points(zr))
-        if not pts:
-            return []
-        pts.sort()
-        out = [pts[0]]
-        for v in pts[1:]:
-            if v - out[-1] > 5e-4:   # merge points closer than 0.5 µm
+        out = []
+        for v in pts:
+            if not out or abs(v - out[-1]) > 5e-4:
                 out.append(v)
         return out
 
@@ -961,7 +961,10 @@ class MeasurePanel(QWidget):
         s.setSingleStep(0.1); s.setValue(val); s.setSuffix(" µm"); return s
 
     def _zmm_spin(self, val):
-        s = QDoubleSpinBox(); s.setRange(0.0, 300.0); s.setDecimals(4)
+        # Negative Z targets allowed (LTS300 reconfigured so its coordinate range
+        # includes negatives). +/-300 range; the controller enforces its own soft
+        # limits -- a move outside them reports a limit error and won't run.
+        s = QDoubleSpinBox(); s.setRange(-300.0, 300.0); s.setDecimals(4)
         s.setSingleStep(0.1); s.setValue(val); s.setSuffix(" mm"); return s
 
     def _zstep_um_spin(self, val):
@@ -1508,9 +1511,14 @@ class MeasurePanel(QWidget):
                     parts.append(f"a={a:.3f}deg")
                 return " ".join(parts)
 
+            # The Z (LTS300) stage is homed by the user IN KINESIS before
+            # connecting -- we never auto-home it. If it reports un-homed,
+            # absolute moves are unreliable, so warn and abort rather than move.
             if p["zscan"] and not getattr(self.sp.delay, "is_homed", True):
-                self.sig_status.emit("homing delay stage...")
-                self.sp.delay.home()
+                self.sig_status.emit(
+                    "Z stage not homed -- home it in Kinesis first, then reconnect "
+                    "(the app will not auto-home). Scan aborted.")
+                self._abort = True
             if p["ascan"] and rotator is not None and not getattr(rotator, "is_homed", True):
                 self.sig_status.emit("homing rotator...")
                 rotator.home()

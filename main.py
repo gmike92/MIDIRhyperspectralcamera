@@ -16,9 +16,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="IRC806 MWIR live viewer")
     parser.add_argument(
         "--mode",
-        choices=("auto", "irc806", "mock"),
+        choices=("auto", "irc806", "ophir", "goldeye", "beamgage", "mock"),
         default="irc806",
-        help="Camera backend (irc806 = IRCameras MWIR via Pleora eBUS)",
+        help="Camera backend (irc806 = IRCameras MWIR; ophir/goldeye = Allied "
+             "Vision Goldeye/SP1203 direct via eBUS; beamgage = SP1203 via BeamGage)",
     )
     parser.add_argument("--fps", type=float, default=120.0,
                         help="Max acquisition rate (cap); camera native is 120 Hz")

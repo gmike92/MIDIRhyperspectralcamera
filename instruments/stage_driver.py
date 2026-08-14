@@ -39,7 +39,10 @@ from typing import Optional
 
 SPEED_OF_LIGHT_MM_FS = 0.000299792458  # mm per fs
 
-# Encoder scaling for common Kinesis stages (counts per mm). Override per stage.
+# Encoder scaling for the pylablib backend (counts per mm). Override per stage.
+# NOTE: the LTS150/LTS300 (409600 counts/mm) is handled via the .NET backend
+# instead, which uses real mm through LoadMotorConfiguration -- this constant
+# does not apply to it.
 DEFAULT_COUNTS_PER_MM = 20000
 
 
@@ -54,6 +57,22 @@ class DelayStage:
 
         self.is_connected = False
         self.is_homed = False
+        # The user homes the stage (in Kinesis) BEFORE connecting and the LTS300
+        # retains its home reference while powered, so on connect we TRUST it is
+        # homed rather than block moves on a stale/late Status.IsHomed read. The
+        # app never auto-homes. Set False to require a positive homed status.
+        self.assume_homed = True
+        # Set the controller's soft-limit approach policy to AllowAllMoves on
+        # connect so moves outside its stock 0..300 soft limits (this stage runs
+        # in a NEGATIVE coordinate range) aren't rejected with "Cannot move to
+        # requested position". HARDWARE limit switches still protect the stage.
+        # Set False to keep the controller's stock limit policy.
+        self.override_limits = True
+        # Move velocity profile. If the controller comes up with velocity=0 (a
+        # common "connects + reads position but won't move" cause) MoveTo blocks
+        # forever, so we set a safe profile on connect. LTS300 max is ~50 mm/s.
+        self.max_velocity_mm_s = 20.0
+        self.acceleration_mm_s2 = 20.0
         self.backend = None             # 'kinesis' | 'apt' | 'dotnet' | 'sim'
         self.serial = None
         self._stage = None              # underlying device object
@@ -90,6 +109,11 @@ class DelayStage:
         from pylablib.devices import Thorlabs
         devices = Thorlabs.list_kinesis_devices()
         devices = [d for d in devices if str(d[0]) not in self._exclude]
+        # LTS150/LTS300 (serial prefix "45") need 409600 counts/mm, not the
+        # pylablib default here -- route them to the .NET path (mm via
+        # LoadMotorConfiguration) so moves are correctly scaled.
+        if not serial:
+            devices = [d for d in devices if not str(d[0]).startswith("45")]
         if not devices:
             return False
         sn = serial or devices[0][0]
@@ -121,34 +145,118 @@ class DelayStage:
             pass
         clr.AddReference("Thorlabs.MotionControl.DeviceManagerCLI")
         clr.AddReference("Thorlabs.MotionControl.GenericMotorCLI")
-        clr.AddReference("Thorlabs.MotionControl.KCube.DCServoCLI")
         from Thorlabs.MotionControl.DeviceManagerCLI import DeviceManagerCLI
-        from Thorlabs.MotionControl.KCube.DCServoCLI import KCubeDCServo
         DeviceManagerCLI.BuildDeviceList()
-        devices = list(DeviceManagerCLI.GetDeviceList())
-        devices = [d for d in devices if str(d) not in self._exclude]
+        devices = [str(d) for d in DeviceManagerCLI.GetDeviceList()]
+        devices = [d for d in devices if d not in self._exclude]
         if not devices:
             return False
-        sn = str(serial) if serial else str(devices[0])
-        try:
-            dev = KCubeDCServo.CreateKCubeDCServo(sn)
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(
-                f"KDC101 {sn}: cannot load device configuration ({e}). Open the "
-                "Thorlabs Kinesis app, select this controller, assign the actuator "
-                "(e.g. Z825B) under Settings -> Device, then retry.") from e
+        # Prefer an integrated-stepper long-travel stage (LTS150/LTS300, serial
+        # prefix "45") for the delay axis; else the first available controller.
+        sn = (str(serial) if serial
+              else next((d for d in devices if d.startswith("45")), devices[0]))
+        dev = self._create_dotnet_device(sn)
         dev.Connect(sn)
         dev.WaitForSettingsInitialized(5000)
         dev.StartPolling(250)
         time.sleep(0.25)
         dev.EnableDevice()
         time.sleep(0.25)
-        # Load the actuator calibration (e.g. Z825B) so MoveTo/Position use
-        # real units (mm) instead of raw device units.
+        # Load the stage calibration so MoveTo/Position use real mm.
         dev.LoadMotorConfiguration(sn)
+        if self.override_limits:
+            self._apply_limit_override(dev)
+        self._apply_velocity(dev)
         self._stage = dev
         self.backend, self.serial = "dotnet", str(sn)
+        # Read the REAL homed status (best-effort, with retries -- polling needs a
+        # moment after EnableDevice) for logging, but never auto-home. With
+        # assume_homed we trust the user's pre-connect homing so moves aren't
+        # blocked by a stale IsHomed=False right after connect.
+        raw = self._dotnet_is_homed(dev)
+        self.is_homed = True if self.assume_homed else bool(raw)
+        print(f"[DelayStage] dotnet {sn}: Status.IsHomed={raw}; is_homed="
+              f"{self.is_homed} (assume_homed={self.assume_homed}, never auto-homes)")
         return True
+
+    def _apply_velocity(self, dev) -> None:
+        """Log the controller's velocity profile and, if it is zero/unset (=> the
+        stage would never actually move), set a safe max-velocity/acceleration."""
+        from System import Decimal
+        cur_v = None
+        try:
+            vp = dev.GetVelocityParams()
+            cur_v = float(Decimal.ToDouble(vp.MaxVelocity))
+            cur_a = float(Decimal.ToDouble(vp.Acceleration))
+            print(f"[DelayStage] velocity on connect: v={cur_v} mm/s, a={cur_a} mm/s^2")
+        except Exception as e:  # noqa: BLE001
+            print(f"[DelayStage] GetVelocityParams failed: {e}")
+        if not cur_v:   # None or 0 -> stage won't move; set a usable profile
+            try:
+                dev.SetVelocityParams(Decimal(float(self.max_velocity_mm_s)),
+                                      Decimal(float(self.acceleration_mm_s2)))
+                print(f"[DelayStage] set velocity v={self.max_velocity_mm_s} mm/s, "
+                      f"a={self.acceleration_mm_s2} mm/s^2")
+            except Exception as e:  # noqa: BLE001
+                print(f"[DelayStage] SetVelocityParams failed: {e}")
+
+    def _apply_limit_override(self, dev) -> None:
+        """Set the controller's SOFTWARE limit approach policy to AllowAllMoves so
+        moves outside the stock soft limits aren't rejected by VerifyDeviceMovement
+        ("Cannot move to requested position"). This LTS300 is parked/operated in a
+        NEGATIVE coordinate range that sits outside the default 0..300 soft limits,
+        so without this every move is refused. HARDWARE limit switches still
+        protect the stage. The enum type is taken from the getter's own return
+        value (nested LimitSettings+LimitsSoftwareApproachPolicies), so it works
+        across Kinesis versions without a hard-coded namespace. Best-effort/logged."""
+        from System import Enum
+        try:
+            cur = dev.GetLimitsSoftwareApproachPolicy()
+            allow = Enum.Parse(cur.GetType(), "AllowAllMoves")
+            dev.SetLimitsSoftwareApproachPolicy(allow)
+            print(f"[DelayStage] soft-limit policy: {cur} -> "
+                  f"{dev.GetLimitsSoftwareApproachPolicy()} (out-of-limit moves allowed)")
+        except Exception as e:  # noqa: BLE001
+            print(f"[DelayStage] could not set soft-limit policy: {str(e).splitlines()[0]}")
+
+    @staticmethod
+    def _dotnet_is_homed(dev):
+        """Best-effort read of the .NET stage's homed flag. Polling (StartPolling)
+        updates dev.Status asynchronously, so retry for ~2 s. Returns bool, or
+        None if the status never became readable."""
+        for _ in range(8):
+            try:
+                return bool(dev.Status.IsHomed)
+            except Exception:  # noqa: BLE001
+                time.sleep(0.25)
+        return None
+
+    @staticmethod
+    def _create_dotnet_device(sn: str):
+        """Create the right Kinesis .NET controller for this serial: an LTS150/
+        LTS300 long-travel integrated stepper (prefix 45) vs a KDC101 K-Cube DC
+        servo (prefix 27). Both expose the same GenericMotor MoveTo/Home/Position
+        API, so the rest of the driver is backend-agnostic."""
+        import clr  # pythonnet
+        prefix = str(sn)[:2]
+        if prefix == "45":   # LTS150 / LTS300 -> LongTravelStage
+            clr.AddReference("Thorlabs.MotionControl.IntegratedStepperMotorsCLI")
+            from Thorlabs.MotionControl.IntegratedStepperMotorsCLI import LongTravelStage
+            try:
+                return LongTravelStage.CreateLongTravelStage(sn)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"LTS {sn}: cannot create LongTravelStage ({e}). Check the "
+                    "stage is powered and its actuator is assigned in Kinesis.") from e
+        clr.AddReference("Thorlabs.MotionControl.KCube.DCServoCLI")
+        from Thorlabs.MotionControl.KCube.DCServoCLI import KCubeDCServo
+        try:
+            return KCubeDCServo.CreateKCubeDCServo(sn)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"KDC101 {sn}: cannot load device configuration ({e}). Open the "
+                "Thorlabs Kinesis app, select this controller, assign the actuator "
+                "(e.g. Z825B) under Settings -> Device, then retry.") from e
 
     def disconnect(self) -> None:
         if not self.is_connected:
@@ -197,7 +305,15 @@ class DelayStage:
             self._stage.move_to(float(position_mm), blocking=wait)
         elif self.backend == "dotnet":
             from System import Decimal
-            self._stage.MoveTo(Decimal(float(position_mm)), 60000 if wait else 0)
+            before = self.get_position_mm()
+            try:
+                self._stage.MoveTo(Decimal(float(position_mm)), 60000 if wait else 0)
+            except Exception as e:  # noqa: BLE001
+                print(f"[DelayStage] MoveTo({position_mm:.4f} mm) FAILED: {e}")
+                raise
+            after = self.get_position_mm()
+            print(f"[DelayStage] MoveTo {position_mm:.4f} mm: "
+                  f"{before:.4f} -> {after:.4f} mm")
         return True
 
     def move_relative_mm(self, delta_mm: float, wait: bool = True) -> bool:
