@@ -82,6 +82,42 @@ def apodization_window(apod_type, size, center, sg_index=7):
     return np.ones(size)
 
 
+def apodization_window_map(apod_type, size, center):
+    """Per-pixel apodization: `center` is an (h, w) ZPD-index map, returns an
+    (size, h, w) window with each pixel peaked (=1) at its OWN ZPD.
+
+    Identical window families and asymmetric-wing scaling as apodization_window
+    (which handles the scalar-centre case), just vectorised across the field so a
+    per-pixel centre map can be used. `boxcar`/unknown -> ones.
+    """
+    apod_type = str(apod_type).lower()
+    size = int(size)
+    center = np.asarray(center, dtype=float)                 # (h, w)
+    if apod_type in ("boxcar", "none", "rectangular"):
+        return np.ones((size,) + center.shape)
+    # Signed normalised distance from each pixel's ZPD, each wing over its own
+    # length (u = 0 at the burst, -1 at the first sample, +1 at the last).
+    left = np.where(center > 0, center, 1.0)                 # (h, w)
+    right = np.where((size - 1 - center) > 0, size - 1 - center, 1.0)
+    d = np.arange(size, dtype=float)[:, None, None] - center[None]     # (size,h,w)
+    u = np.clip(np.where(d <= 0, d / left[None], d / right[None]), -1.0, 1.0)
+    au = np.abs(u)
+    if apod_type == "happ-genzel":
+        return 0.54 + 0.46 * np.cos(np.pi * u)
+    if apod_type == "blackman-harris-3":
+        return (0.42323 + 0.49755 * np.cos(np.pi * u)
+                + 0.07922 * np.cos(2 * np.pi * u))
+    if apod_type == "blackman-harris-4":
+        return (0.35875 + 0.48829 * np.cos(np.pi * u)
+                + 0.14128 * np.cos(2 * np.pi * u)
+                + 0.01168 * np.cos(3 * np.pi * u))
+    if apod_type == "triangular":
+        return 1.0 - au
+    if apod_type == "supergaussian":
+        return np.exp(-np.log(200.0) * au ** (2 * 7))
+    return np.ones((size,) + center.shape)
+
+
 def _fourier_dir(t, s, nu):
     """Explicit matrix DFT, FourierDir.m: (Dt*s) @ exp(-2j*pi*t'*nu)."""
     t = np.asarray(t, dtype=float)

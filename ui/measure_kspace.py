@@ -692,7 +692,26 @@ class MeasurePanel(QWidget):
         self.spin_ftwidth.setToolTip("Half-width around ZPD separating center from tails.")
         grid.addWidget(QLabel("FT region"), 8, 0); grid.addWidget(self.combo_ftregion, 8, 1)
         grid.addWidget(QLabel("FT width (±ZPD)"), 9, 0); grid.addWidget(self.spin_ftwidth, 9, 1)
+
+        # Apodization ZPD centre: an independent I² barycentre per pixel (DEFAULT
+        # -- follows a zero-path position that varies across the field of view),
+        # or one field-wide envelope centre-burst (signed spatial sum).
+        self.combo_center = QComboBox()
+        self.combo_center.addItems(["barycentre (per-pixel)", "envelope (field)"])
+        self.combo_center.setCurrentText("barycentre (per-pixel)")
+        self.combo_center.setToolTip(
+            "How the apodization centre (ZPD) is located:\n"
+            "  barycentre (per-pixel) = each pixel's own I² centroid (default)\n"
+            "  envelope (field)       = one centre-burst for the whole frame")
+        self.combo_center.currentTextChanged.connect(self._save_settings)
+        grid.addWidget(QLabel("Apod centre"), 10, 0); grid.addWidget(self.combo_center, 10, 1)
         return g
+
+    def _center_method(self) -> str:
+        """Apodization-centre method for the processor: 'barycenter' (per-pixel,
+        default) or 'envelope' (field-wide)."""
+        return ("barycenter" if self.combo_center.currentText().startswith("bary")
+                else "envelope")
 
     def _build_postproc_group(self) -> QGroupBox:
         g = QGroupBox("Post-processing")
@@ -1030,6 +1049,9 @@ class MeasurePanel(QWidget):
         ftr = self._settings.value("ks_ftregion", None)
         if ftr is not None:
             self.combo_ftregion.setCurrentText(str(ftr))
+        ctr = self._settings.value("ks_apod_center", None)
+        if ctr is not None:
+            self.combo_center.setCurrentText(str(ctr))
         wo = self._settings.value("ks_walkoff_on", None)
         if wo is not None:
             self.chk_walkoff.setChecked(str(wo).lower() == "true")
@@ -1049,6 +1071,7 @@ class MeasurePanel(QWidget):
             self._settings.setValue(key, widget.value())
         self._settings.setValue("ks_apod_type", self.combo_apod.currentText())
         self._settings.setValue("ks_ftregion", self.combo_ftregion.currentText())
+        self._settings.setValue("ks_apod_center", self.combo_center.currentText())
         self._settings.setValue("ks_walkoff_on", self.chk_walkoff.isChecked())
         self._settings.setValue("ks_save_mode", self.combo_save.currentText())
         for key, chk in self._persisted_checks().items():
@@ -1186,6 +1209,7 @@ class MeasurePanel(QWidget):
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
             svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
             ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
+            center_method=self._center_method(),
             zscan=zscan, z_targets=z_targets,
             ascan=ascan, a_targets=a_targets,
         )
@@ -1204,6 +1228,7 @@ class MeasurePanel(QWidget):
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
             svd_denoise=params["svd_on"], svd_k=params["svd_k"],
             ft_region=params["ft_region"], ft_width_mm=params["ft_width"],
+            apod_center=params["center_method"],
             zscan=zscan, filename=self.edit_filename.text().strip() or "kspace",
             z_n_positions=len(z_targets), z_positions_mm=list(z_targets),
             z_zones=[dict(start_mm=zr["z0"].value(), stop_mm=zr["z1"].value(),
@@ -1319,12 +1344,14 @@ class MeasurePanel(QWidget):
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
             svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
             ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
+            center_method=self._center_method(),
         )
         # Keep the saved metadata in step with what was recomputed.
         self._scan_meta.update(
             ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
             apodization=p["apod_type"], apod_width=p["apod"],
             wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
+            apod_center=p["center_method"],
             svd_denoise=p["svd_on"], svd_k=p["svd_k"], recomputed=True)
         self._per_position_saved = False   # recompute result is saved as one set
         self.btn_run.setEnabled(False)
@@ -1351,7 +1378,8 @@ class MeasurePanel(QWidget):
                     apod_width=p["apod"], n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],
-                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"])
+                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
+                    center_method=p["center_method"])
                 if cube is None:
                     continue
                 if p["svd_on"]:
@@ -1620,7 +1648,8 @@ class MeasurePanel(QWidget):
                     apod_width=p["apod"], n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],
-                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"])
+                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
+                    center_method=p["center_method"])
                 if cube is None:
                     continue
                 if p["svd_on"]:
