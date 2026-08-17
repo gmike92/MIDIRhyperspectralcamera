@@ -85,6 +85,22 @@ def find_centerburst(signal_1d, positions, expected_zero_mm=None, search_mm=None
     return int(np.argmax(np.where(mask, env, -np.inf)))
 
 
+def barycenter_map(sig):
+    """Per-pixel ZPD index via the I^2 barycentre (MATLAB
+    center = round((1:N)*(I.^2)/(sum(I.^2)+1))), computed INDEPENDENTLY for every
+    pixel so a ZPD that shifts across the field of view is followed per pixel.
+
+    `sig` is the (n_pos, h, w) baseline-removed interferogram; returns an (h, w)
+    integer index map (0-based, clipped to the valid range). The `+1` in the
+    denominator regularises signal-free pixels (they collapse toward index 0).
+    """
+    w2 = np.asarray(sig, dtype=float) ** 2
+    n = w2.shape[0]
+    k = np.arange(n, dtype=float)[:, None, None]
+    c = np.round(np.sum(k * w2, axis=0) / (np.sum(w2, axis=0) + 1.0)).astype(int)
+    return np.clip(c, 0, n - 1)
+
+
 class HyperspectralProcessor:
     """
     Process a 3D datacube (n_positions, h, w) into a spectrum cube.
@@ -204,9 +220,14 @@ class HyperspectralProcessor:
                                expected_zero_mm=None, search_mm=None,
                                apod_type="gaussian", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
-                               positions_calibrated=False):
+                               positions_calibrated=False, center_method="envelope"):
         """
         Compute per-pixel DFT on a (n_pos, h, w) datacube.
+
+        `center_method`: how the apodization ZPD centre is found --
+        "envelope" (default) = one Hilbert-envelope centre-burst for the whole
+        field (signed spatial sum); "barycenter" = an independent I^2 barycentre
+        per pixel, so a ZPD that varies across the field is followed per pixel.
         If reference_cube is provided, extracts spectral phase and returns the Absorptive (Real) part.
 
         `positions_calibrated`: set True when `positions` is ALREADY the
@@ -259,8 +280,10 @@ class HyperspectralProcessor:
 
         sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
 
+        per_pixel = str(center_method).lower().startswith("bary")
+
         # Helper for baseline & apodization
-        def preprocess(cube, force_center_idx=None, c_pos=None):
+        def preprocess(cube, force_center=None, c_pos=None):
             if c_pos is None:
                 c_pos = positions
 
@@ -272,17 +295,26 @@ class HyperspectralProcessor:
             baseline = uniform_filter1d(cube, size=window, axis=0, mode='nearest')
             sig = cube - baseline
 
-            if force_center_idx is not None:
-                center_idx = force_center_idx
+            # ZPD centre: either forced (reference-shared), one field-wide value
+            # (envelope), or an independent per-pixel barycentre map.
+            if force_center is not None:
+                center = force_center
+            elif per_pixel:
+                center = barycenter_map(sig)                 # (h, w) index map
             else:
                 # Collapse to a 1-D interferogram by SIGNED spatial sum (the
                 # common-path fringe phase is shared across the field, so signed
                 # summing reinforces the burst and cancels DC), then take the
                 # analytic-envelope ZPD.
                 interf_1d = np.sum(sig, axis=(1, 2))
-                center_idx = find_centerburst(interf_1d, c_pos, expected_zero_mm, search_mm)
+                center = find_centerburst(interf_1d, c_pos, expected_zero_mm, search_mm)
 
-            if sym_flag:
+            scalar = np.ndim(center) == 0
+
+            # Symmetrisation only makes sense for one shared centre; skip it for a
+            # per-pixel map (the position axis is common to all pixels).
+            if sym_flag and scalar:
+                center_idx = int(center)
                 left_len = center_idx
                 right_len = len(sig) - 1 - center_idx
 
@@ -301,22 +333,32 @@ class HyperspectralProcessor:
 
                 sig = sym_signal
                 c_pos = sym_positions
-                center_idx = len(sig) // 2
+                center = center_idx = len(sig) // 2
 
+            cpos_c = c_pos[center]                  # scalar, or (h, w) per-pixel
             try:
-                print(f"[K-Space PP] Computed ZERO (burst center): {c_pos[center_idx]:.4f} mm (index {center_idx})")
+                _c = float(cpos_c) if scalar else float(np.median(cpos_c))
+                print(f"[K-Space PP] ZPD centre ({center_method}): {_c:.4f} mm"
+                      + ("" if scalar else " (per-pixel median)"))
             except Exception:
                 pass
 
             if str(apod_type).lower() == "gaussian":
                 sigma = abs(c_pos[-1] - c_pos[0]) * apod_width
                 if sigma > 0:
-                    apod = np.exp(-(c_pos - c_pos[center_idx])**2 / (2.0 * sigma**2))
+                    if scalar:
+                        apod = np.exp(-(c_pos - cpos_c)**2 / (2.0 * sigma**2))
+                    else:
+                        apod = np.exp(-(c_pos[:, None, None] - cpos_c[None])**2
+                                      / (2.0 * sigma**2))
                 else:
                     apod = np.ones(len(c_pos))
-            else:
+            elif scalar:
                 from instruments.dsp import apodization_window
-                apod = apodization_window(apod_type, len(c_pos), center_idx)
+                apod = apodization_window(apod_type, len(c_pos), center)
+            else:
+                from instruments.dsp import apodization_window_map
+                apod = apodization_window_map(apod_type, len(c_pos), center)
 
             # FT-window: which part of the interferogram to transform.
             #   center -> broad spectral features (low resolution)
@@ -327,19 +369,26 @@ class HyperspectralProcessor:
             if ft_window_mm is not None:
                 lo, hi = sorted(float(v) for v in ft_window_mm)
                 inwin = (c_pos >= lo) & (c_pos <= hi)
-                apod = (apod * inwin) if (lo <= c_pos[center_idx] <= hi) else inwin.astype(float)
+                if scalar:
+                    apod = (apod * inwin) if (lo <= cpos_c <= hi) else inwin.astype(float)
+                else:
+                    in_c = (cpos_c >= lo) & (cpos_c <= hi)          # (h, w)
+                    box = np.broadcast_to(inwin[:, None, None].astype(float), apod.shape)
+                    apod = np.where(in_c[None], apod * inwin[:, None, None], box)
             elif ft_region and str(ft_region).lower() != "full":
-                delta = np.abs(c_pos - c_pos[center_idx])
+                delta = (np.abs(c_pos - cpos_c) if scalar
+                         else np.abs(c_pos[:, None, None] - cpos_c[None]))
                 if str(ft_region).lower() == "center":
                     apod = apod * (delta <= ft_width_mm)
                 else:  # "tails": keep the wings, drop the ZPD-centered taper
                     apod = (delta > ft_width_mm).astype(float)
-            return sig * apod[:, np.newaxis, np.newaxis], center_idx, c_pos
+            apod3 = apod[:, np.newaxis, np.newaxis] if apod.ndim == 1 else apod
+            return sig * apod3, center, c_pos
 
         if reference_cube is not None:
             reference_cube = np.asarray(reference_cube, dtype=float)
             ref_signal, fixed_center, ref_pos = preprocess(reference_cube)
-            signal, _, final_pos = preprocess(datacube, force_center_idx=fixed_center, c_pos=ref_pos)
+            signal, _, final_pos = preprocess(datacube, force_center=fixed_center, c_pos=ref_pos)
         else:
             signal, _, final_pos = preprocess(datacube)
 
@@ -383,7 +432,7 @@ class HyperspectralProcessor:
                             apod_width=0.2, apod_type="gaussian",
                             expected_zero_mm=None, search_mm=None,
                             ft_window_mm=None, positions_calibrated=False,
-                            reference_cube=None):
+                            reference_cube=None, center_method="envelope"):
         """Per-pixel COMPLEX DFT at ONE wavelength -> (complex_map (h,w), info).
 
         The saved spectrum cube keeps only the DFT magnitude (np.abs), throwing
@@ -429,37 +478,61 @@ class HyperspectralProcessor:
         ref_sig = (ref - uniform_filter1d(ref, size=window, axis=0, mode='nearest')
                    if ref is not None else None)
         burst_src = ref_sig if ref_sig is not None else sig
-        center_idx = find_centerburst(np.sum(burst_src, axis=(1, 2)), positions,
+        # ZPD centre: one field-wide envelope value, or an independent per-pixel
+        # barycentre map (same choice as compute_hyperspectral, kept in step so
+        # the phase view matches the recomputed cube).
+        if str(center_method).lower().startswith("bary"):
+            center = barycenter_map(burst_src)             # (h, w) index map
+        else:
+            center = find_centerburst(np.sum(burst_src, axis=(1, 2)), positions,
                                       expected_zero_mm, search_mm)
+        scalar = np.ndim(center) == 0
+        cpos_c = positions[center]                         # scalar or (h, w)
 
         # Apodization (gaussian in position space, or a named FTIR window).
         if str(apod_type).lower() == "gaussian":
             sigma = abs(positions[-1] - positions[0]) * apod_width
-            apod = (np.exp(-(positions - positions[center_idx]) ** 2 / (2.0 * sigma ** 2))
-                    if sigma > 0 else np.ones(len(positions)))
-        else:
+            if sigma <= 0:
+                apod = np.ones(len(positions))
+            elif scalar:
+                apod = np.exp(-(positions - cpos_c) ** 2 / (2.0 * sigma ** 2))
+            else:
+                apod = np.exp(-(positions[:, None, None] - cpos_c[None]) ** 2
+                              / (2.0 * sigma ** 2))
+        elif scalar:
             from instruments.dsp import apodization_window
-            apod = apodization_window(apod_type, len(positions), center_idx)
+            apod = apodization_window(apod_type, len(positions), center)
+        else:
+            from instruments.dsp import apodization_window_map
+            apod = apodization_window_map(apod_type, len(positions), center)
 
         # FT window: keep the taper if the window contains the ZPD, else a boxcar
         # (matches compute_hyperspectral's ft_window_mm branch).
         if ft_window_mm is not None:
             lo, hi = sorted(float(v) for v in ft_window_mm)
             inwin = (positions >= lo) & (positions <= hi)
-            apod = (apod * inwin) if (lo <= positions[center_idx] <= hi) else inwin.astype(float)
+            if scalar:
+                apod = (apod * inwin) if (lo <= cpos_c <= hi) else inwin.astype(float)
+            else:
+                in_c = (cpos_c >= lo) & (cpos_c <= hi)     # (h, w)
+                box = np.broadcast_to(inwin[:, None, None].astype(float), apod.shape)
+                apod = np.where(in_c[None], apod * inwin[:, None, None], box)
 
         # Single-frequency DFT for the requested wavelength.
         freq = self._get_frequency_limits(wavelength_um, wavelength_um)[0]
         dpos = np.diff(positions)
         dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0.0)
-        wkernel = (dpos * apod)[:, np.newaxis, np.newaxis]
+        wkernel = ((dpos * apod)[:, np.newaxis, np.newaxis] if apod.ndim == 1
+                   else dpos[:, np.newaxis, np.newaxis] * apod)
         kernel = np.exp(-2j * np.pi * positions * freq)          # (n_pos,)
         spec_flat = np.conj(kernel) @ (sig * wkernel).reshape(n_pos, -1)  # (h*w,)
         complex_map = spec_flat.reshape(h, w)
         if ref_sig is not None:
             ref_spec = np.conj(kernel) @ (ref_sig * wkernel).reshape(n_pos, -1)
             complex_map = complex_map * np.exp(-1j * np.angle(ref_spec.reshape(h, w)))
-        info = {"center_mm": float(positions[center_idx]), "freq": float(freq),
-                "n_used": int(np.count_nonzero(apod)),
+        info = {"center_mm": float(cpos_c) if scalar else float(np.median(cpos_c)),
+                "freq": float(freq), "per_pixel_center": not scalar,
+                "n_used": int(np.count_nonzero(apod.any(axis=(1, 2)) if apod.ndim == 3
+                                               else apod)),
                 "phase_corrected": ref_sig is not None}
         return complex_map, info

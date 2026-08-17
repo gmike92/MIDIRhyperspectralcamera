@@ -706,15 +706,26 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.r_apod = QtWidgets.QComboBox()
         self.r_apod.addItems(["gaussian", "happ-genzel", "blackman-harris-3",
                               "blackman-harris-4", "boxcar"])
+        # How the apodization ZPD centre is found: one field-wide centre-burst
+        # (envelope of the signed spatial sum), or an independent I^2 barycentre
+        # per pixel (follows a ZPD that drifts across the field of view).
+        self.r_center = QtWidgets.QComboBox()
+        self.r_center.addItems(["envelope (field)", "barycentre (per-pixel)"])
+        self.r_center.setToolTip(
+            "Apodization centre:\n"
+            "• envelope (field): one ZPD for the whole frame (robust, default).\n"
+            "• barycentre (per-pixel): each pixel's own I² barycentre, so a ZPD "
+            "that varies across the field is followed per pixel.")
         self.r_wl0 = QtWidgets.QDoubleSpinBox(); self.r_wl0.setRange(0.1, 100); self.r_wl0.setSuffix(" µm")
         self.r_wl1 = QtWidgets.QDoubleSpinBox(); self.r_wl1.setRange(0.1, 100); self.r_wl1.setSuffix(" µm")
         self.r_nfreq = QtWidgets.QSpinBox(); self.r_nfreq.setRange(0, 8192)
         self.r_nfreq.setSpecialValueText("Auto")
-        for wdg in (self.r_apod, self.r_wl0, self.r_wl1, self.r_nfreq):
+        for wdg in (self.r_apod, self.r_center, self.r_wl0, self.r_wl1, self.r_nfreq):
             sig = (wdg.currentTextChanged if isinstance(wdg, QtWidgets.QComboBox)
                    else wdg.valueChanged)
             sig.connect(self._recompute_if_on)
         form.addRow("Apodization", self.r_apod)
+        form.addRow("Apod. centre", self.r_center)
         form.addRow("λ from", self.r_wl0); form.addRow("λ to", self.r_wl1)
         form.addRow("N freq", self.r_nfreq)
         ig.addLayout(form)
@@ -1296,7 +1307,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             ft_window_mm=self.win_region.getRegion(),
             expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
             positions_calibrated=self.current_positions_calibrated(),
-            reference_cube=self._phase_ref_cube(raw.shape))
+            reference_cube=self._phase_ref_cube(raw.shape),
+            center_method=self._center_method())
+
+    def _center_method(self):
+        """The apodization-centre method selected in the recompute panel:
+        'barycenter' (per-pixel) or 'envelope' (field-wide, default)."""
+        return ("barycenter" if self.r_center.currentText().startswith("bary")
+                else "envelope")
 
     def _sync_wl_slider(self, nf=None):
         self._apply_wl_slider_range()
@@ -1980,7 +1998,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 ft_window_mm=self.win_region.getRegion(),
                 expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                 positions_calibrated=self.current_positions_calibrated(),
-                reference_cube=self._phase_ref_cube(raw.shape))
+                reference_cube=self._phase_ref_cube(raw.shape),
+                center_method=self._center_method())
         except Exception as e:  # noqa: BLE001
             self.ph_info.setText(f"Phase compute failed: {e}")
             return
@@ -2099,6 +2118,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.proc = HyperspectralProcessor()
         wl0, wl1 = self.r_wl0.value(), self.r_wl1.value()
         apod = self.r_apod.currentText(); win = list(self.win_region.getRegion())
+        cmethod = self._center_method()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         saved = skipped = 0
         try:
@@ -2122,7 +2142,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                     pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
                     search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
-                    reference_cube=ref_raw)
+                    reference_cube=ref_raw, center_method=cmethod)
                 if cube is None:
                     skipped += 1
                     continue
@@ -2464,6 +2484,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         win = list(self.win_region.getRegion())
         wl0, wl1, nfset = self.r_wl0.value(), self.r_wl1.value(), self.r_nfreq.value()
         apod = self.r_apod.currentText()
+        cmethod = self._center_method()
         if self.proc is None:
             self.proc = HyperspectralProcessor()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
@@ -2490,9 +2511,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 wl, cube = self.proc.compute_hyperspectral(
                     pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
-                    search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated)
+                    search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
+                    center_method=cmethod)
                 meta.update(recompute_window_mm=win, recompute_apod=apod,
-                            recompute_wl_um=[wl0, wl1], recompute_nfreq=int(nfreq))
+                            recompute_wl_um=[wl0, wl1], recompute_nfreq=int(nfreq),
+                            recompute_center=cmethod)
                 kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
                           z_value_mm=info["z"], z_unit="mm",
                           metadata=np.array(meta, dtype=object),
