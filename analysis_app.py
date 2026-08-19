@@ -2006,6 +2006,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.ph_cbar_amp.setLevels((0.0, hi))
         self.ph_img_phase.setImage(ph_masked, autoLevels=False, levels=(-np.pi, np.pi))
         self._last_phase = (amp, phase)
+        self._last_phase_lam = lam        # wavelength of this map, for the export header
         axis_txt = ("calibrated axis (as-is)" if self.current_positions_calibrated()
                     else "raw axis + motor cal")
         corr = ("BACKGROUND-CORRECTED phase" if info.get("phase_corrected")
@@ -2028,12 +2029,26 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             "Tab-separated (*.tsv *.txt)")
         if not path:
             return
+        # Bake in the SAME amplitude mask shown on screen: phase -> NaN below
+        # <thr>% of the peak amplitude, so the saved map carries the chosen mask
+        # (the Stokes-maps app reads NaN phase as masked-out). Amplitude stays
+        # raw so the |field| values are always available for the Stokes formulae.
+        amax = float(np.nanmax(amp)) if amp.size else 0.0
+        thr_pct = float(self.ph_thresh.value())
+        phase_out = phase.copy()
+        if amax > 0:
+            phase_out[amp < (thr_pct / 100.0) * amax] = np.nan
+        lam = getattr(self, "_last_phase_lam", None)
         h, w = amp.shape
         rows, cols = np.mgrid[0:h, 0:w]
         data = np.column_stack([cols.ravel(), rows.ravel(),
-                                amp.ravel(), phase.ravel()])
-        np.savetxt(path, data, fmt="%.6g", delimiter="\t",
-                   header="col\trow\tamplitude\tphase_rad", comments="")
+                                amp.ravel(), phase_out.ravel()])
+        header = "\n".join([
+            f"wavelength_um\t{lam:.6g}" if lam is not None else "wavelength_um\t",
+            f"amplitude_mask_percent\t{thr_pct:.6g}",
+            "col\trow\tamplitude\tphase_rad",   # phase = NaN where amplitude < mask
+        ])
+        np.savetxt(path, data, fmt="%.6g", delimiter="\t", header=header, comments="# ")
         self.statusBar().showMessage(f"Saved {data.shape[0]} rows to {path}", 5000)
 
     # -- background phase correction ------------------------------------------
