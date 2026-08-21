@@ -44,12 +44,10 @@ for _p in [_HERE, os.path.join(_HERE, '..')]:
 
 
 def add_path(path):
-    """Make CameraDevice.py importable, preferring a copy INSIDE the repo so no
-    external sibling folder is needed.
+    """Make CameraDevice.py importable from INSIDE the repo (no external folder).
 
-    Search order (first hit wins), the containing dir is put on sys.path:
-        camera/vendor/CameraDevice.py     <-- recommended: drop your file here
-        camera/CameraDevice.py
+    Search order (first hit wins); the containing dir is put on sys.path:
+        camera/CameraDevice.py            <-- recommended: keep it next to this file
         <repo>/CameraDevice.py
         <repo>/../<path>/CameraDevice.py  <-- legacy sibling folder (e.g.
                                               ../Hamamatsu_ScopeFoundry), kept
@@ -58,7 +56,6 @@ def add_path(path):
     here = os.path.dirname(os.path.abspath(__file__))   # .../camera
     repo = os.path.dirname(here)                          # repo root
     candidates = [
-        os.path.join(here, 'vendor'),
         here,
         repo,
         os.path.join(os.path.dirname(repo), path),
@@ -69,8 +66,8 @@ def add_path(path):
                 sys.path.insert(0, d)
             return d
     searched = "\n    ".join(candidates)
-    print("[Camera] WARNING: CameraDevice.py not found. Put your file in "
-          "camera\\vendor\\CameraDevice.py. Searched:\n    " + searched)
+    print("[Camera] WARNING: CameraDevice.py not found. Put it next to this file "
+          "as camera\\CameraDevice.py. Searched:\n    " + searched)
     return None
 
 
