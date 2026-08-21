@@ -44,19 +44,34 @@ for _p in [_HERE, os.path.join(_HERE, '..')]:
 
 
 def add_path(path):
-    """Add a folder under the 'ScopeFoundry Projects' root to sys.path.
+    """Make CameraDevice.py importable, preferring a copy INSIDE the repo so no
+    external sibling folder is needed.
 
-    This file is at  <ScopeFoundry Projects>/HyperMeasurementApp/hardware/camera.py
-    so the projects root is three levels up; `path` (e.g. 'Hamamatsu_ScopeFoundry')
-    is a sibling of HyperMeasurementApp.
+    Search order (first hit wins), the containing dir is put on sys.path:
+        camera/vendor/CameraDevice.py     <-- recommended: drop your file here
+        camera/CameraDevice.py
+        <repo>/CameraDevice.py
+        <repo>/../<path>/CameraDevice.py  <-- legacy sibling folder (e.g.
+                                              ../Hamamatsu_ScopeFoundry), kept
+                                              for backward compatibility.
     """
-    here = os.path.abspath(__file__)
-    projects_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
-    target = os.path.join(projects_root, path)
-    if not os.path.isdir(target):
-        print(f"[Camera] WARNING: expected device folder not found: {target}")
-    if target not in sys.path:
-        sys.path.append(target)
+    here = os.path.dirname(os.path.abspath(__file__))   # .../camera
+    repo = os.path.dirname(here)                          # repo root
+    candidates = [
+        os.path.join(here, 'vendor'),
+        here,
+        repo,
+        os.path.join(os.path.dirname(repo), path),
+    ]
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, 'CameraDevice.py')):
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            return d
+    searched = "\n    ".join(candidates)
+    print("[Camera] WARNING: CameraDevice.py not found. Put your file in "
+          "camera\\vendor\\CameraDevice.py. Searched:\n    " + searched)
+    return None
 
 
 class HamamatsuCamera:
