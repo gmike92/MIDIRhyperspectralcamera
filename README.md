@@ -111,7 +111,7 @@ per-pixel continuum-subtraction method used to isolate the resonant line image.
 
 ## Setup (one time)
 Clone this branch folder. 
-Create virtual environment (midir) with the necessary libraries:
+Create virtual environment (e.g., midir) with the necessary libraries:
 ```bat
 cd MIDIRhyperspectralcamera
 conda create -n midir python=3.12
