@@ -282,7 +282,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(_w)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["orca", "mock", "auto"])
+        self.mode_combo.addItems(["orca", "irc806", "mock", "auto"])
         self.mode_combo.setCurrentText(self.current_mode)
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)

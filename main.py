@@ -17,10 +17,12 @@ def parse_args() -> argparse.Namespace:
         description="Hyperspectral camera live viewer (Hamamatsu Orca + TWINS/SmarAct MCS2)")
     parser.add_argument(
         "--mode",
-        choices=("auto", "orca", "mock"),
+        choices=("auto", "orca", "irc806", "mock"),
         default="orca",
         help="Camera backend (orca = Hamamatsu Orca Flash via DCAM; "
-             "mock = synthetic beam; auto = try orca then fall back to mock)",
+             "irc806 = IRCameras IRC806 via Pleora eBUS; "
+             "mock = synthetic beam; auto = try orca then fall back to mock). "
+             "Also switchable at runtime from the Connection-mode dropdown.",
     )
     parser.add_argument("--fps", type=float, default=60.0,
                         help="Max acquisition rate cap (Hz); the camera exposure sets "
