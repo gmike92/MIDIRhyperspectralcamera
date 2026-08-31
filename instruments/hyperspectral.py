@@ -220,9 +220,15 @@ class HyperspectralProcessor:
                                expected_zero_mm=None, search_mm=None,
                                apod_type="gaussian", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
-                               positions_calibrated=False, center_method="envelope"):
+                               positions_calibrated=False, center_method="envelope",
+                               complex_out=False):
         """
         Compute per-pixel DFT on a (n_pos, h, w) datacube.
+
+        `complex_out=True` returns the full COMPLEX spectrum G(ω) = F·e^{-iΦ}
+        (phased when a reference is given, else the raw spectrum) instead of the
+        real/absorptive magnitude -- same forward transform, all wavelengths at
+        once, for callers that need the quadratures (e.g. the Stokes viewer).
 
         `center_method`: how the apodization ZPD centre is found --
         "envelope" (default) = one Hilbert-envelope centre-burst for the whole
@@ -420,8 +426,12 @@ class HyperspectralProcessor:
 
             phase_correction = np.angle(ref_spec_flat)
             phased_spec_flat = spec_flat * np.exp(-1j * phase_correction)
+            if complex_out:
+                return wavelengths, phased_spec_flat.reshape(n_freq, h, w).astype(np.complex64)
             spectrum_cube = np.real(phased_spec_flat).reshape(n_freq, h, w)
         else:
+            if complex_out:
+                return wavelengths, spec_flat.reshape(n_freq, h, w).astype(np.complex64)
             spectrum_cube = np.abs(spec_flat).reshape(n_freq, h, w)
 
         # Magnitude/absorptive spectra don't need float64 -- float32 halves the

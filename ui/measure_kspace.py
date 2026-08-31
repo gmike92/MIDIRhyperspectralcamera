@@ -49,6 +49,19 @@ def _free_gb(path):
     except Exception:  # noqa: BLE001
         return None
 
+
+def _fmt_hms(seconds: float) -> str:
+    """Human-readable duration, e.g. 3725 -> '1h 2m 5s'."""
+    s = max(0, int(round(seconds)))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 from instruments.subtwinslv import TwinsScanner
 from instruments.hyperspectral import (
     HyperspectralProcessor, DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
@@ -494,6 +507,7 @@ class MeasurePanel(QWidget):
     sig_done = QtCore.pyqtSignal(object, object, object, object)  # wl, cubes, z, sat_masks
     sig_point = QtCore.pyqtSignal(float, float, bool)  # pos, ROI-mean, is_first_of_scan
     sig_warn = QtCore.pyqtSignal(str, str)  # (title, message) -> modal warning on the GUI thread
+    sig_estimate = QtCore.pyqtSignal(str)   # acquisition-time estimate text
 
     def __init__(self, stages_panel, frame_source, roi_provider,
                  roi_show=None, bg_provider=None, save_dir_provider=None,
@@ -566,6 +580,7 @@ class MeasurePanel(QWidget):
         self.sig_done.connect(self._on_done)
         self.sig_point.connect(self._on_point)
         self.sig_warn.connect(self._on_warn)
+        self.sig_estimate.connect(self._on_estimate)
         # The master scan checkboxes drive the (Z × angle) grid-size readout.
         self.chk_zscan.toggled.connect(self._update_grid_label)
         self.chk_ascan.toggled.connect(self._update_grid_label)
@@ -927,6 +942,20 @@ class MeasurePanel(QWidget):
         row.addWidget(self.btn_run); row.addWidget(self.btn_pause)
         row.addWidget(self.btn_stop)
         v.addLayout(row)
+        est_row = QHBoxLayout()
+        self.btn_estimate = QPushButton("Estimate time")
+        self.btn_estimate.setToolTip(
+            "Time ONE interferogram point (a single wedge step: move + settle + "
+            "frame read) and multiply by the total number of points "
+            "(steps × Z × angle) to estimate the total acquisition time. "
+            "Moves the TWINS wedge one step only.")
+        self.btn_estimate.clicked.connect(self._estimate_time)
+        est_row.addWidget(self.btn_estimate)
+        self.lbl_estimate = QLabel("")
+        self.lbl_estimate.setWordWrap(True)
+        self.lbl_estimate.setStyleSheet("color:#39c; font-size:11px;")
+        est_row.addWidget(self.lbl_estimate, 1)
+        v.addLayout(est_row)
         row2 = QHBoxLayout()
         self.btn_recompute = QPushButton("Recompute")
         self.btn_recompute.clicked.connect(self._recompute)
@@ -1331,6 +1360,75 @@ class MeasurePanel(QWidget):
         while self._paused and not self._abort:
             time.sleep(0.1)
 
+    @staticmethod
+    def _bin_cube(cube, factor):
+        """Block-average each (h, w) frame of a raw cube by `factor`. factor<=1 is
+        a no-op. Binning is applied ONLY to compute the spectral hypercube -- the
+        saved raw interferogram stays at FULL spatial resolution so it can be
+        recomputed at any binning (or full res) later."""
+        from instruments.subtwinslv import bin_image
+        cube = np.asarray(cube)
+        if factor is None or int(factor) <= 1 or cube.ndim != 3:
+            return cube
+        f = int(factor)
+        return np.stack([bin_image(cube[i], f) for i in range(cube.shape[0])])
+
+    def _estimate_time(self) -> None:
+        """Acquire ONE cube at the current settings, time it, and multiply by the
+        number of grid points (Z × angle) to estimate total acquisition time."""
+        t = getattr(self, "_scan_thread", None)
+        if t is not None and t.is_alive():
+            return
+        if not getattr(getattr(self.sp, "twins", None), "is_connected", False):
+            self.sig_estimate.emit("TWINS not connected")
+            return
+        if self.frame_source() is None:
+            self.sig_estimate.emit("No live frame — start the camera first")
+            return
+        # Grid size = product of the enabled scan axes' point counts.
+        nz = len(self._zone_targets()) if self.chk_zscan.isChecked() else 1
+        na = len(self._angle_targets()) if self.chk_ascan.isChecked() else 1
+        grid_total = max(nz, 1) * max(na, 1)
+        p = dict(start=self.spin_start.value(), stop=self.spin_stop.value(),
+                 n=self.spin_steps.value(), frames=self.spin_frames.value(),
+                 roi=(self.roi_provider() if self.roi_provider else None))
+        self.btn_estimate.setEnabled(False)
+        self.lbl_estimate.setText("timing one cube…")
+        threading.Thread(target=self._estimate_worker, args=(p, grid_total),
+                         daemon=True).start()
+
+    def _estimate_worker(self, p: dict, grid_total: int) -> None:
+        try:
+            scanner = TwinsScanner(self.sp.twins, self.frame_source)
+            start, stop, n = p["start"], p["stop"], int(p["n"])
+            step = (stop - start) / (n - 1) if n > 1 else 0.0
+            settle = 0.05   # scan_cube's default per-step settle
+            # Position at the start first (NOT timed), then time exactly ONE
+            # interferogram point = one wedge step: move + settle + frame read.
+            scanner.stage.move_to(float(start)); scanner.stage.wait_for_stop()
+            time.sleep(settle)
+            t0 = time.time()
+            scanner.stage.move_to(float(start + step)); scanner.stage.wait_for_stop()
+            time.sleep(settle)
+            sl = scanner._read_roi_slice(p["roi"], p["frames"], 1, 1, background=None)
+            t_point = time.time() - t0
+            if sl is None or t_point <= 0:
+                self.sig_estimate.emit("estimate failed (no frame acquired)")
+                return
+            n_points = n * grid_total          # steps per cube × grid points
+            total = t_point * n_points
+            self.sig_estimate.emit(
+                f"≈ {_fmt_hms(total)} total  —  {n_points} points "
+                f"({n} steps × {grid_total} grid pt{'s' if grid_total != 1 else ''}), "
+                f"{t_point * 1000:.0f} ms/point. Excludes Z/angle moves & FFT/save.")
+        except Exception as e:  # noqa: BLE001
+            self.sig_estimate.emit(f"estimate failed: {e}")
+
+    @QtCore.pyqtSlot(str)
+    def _on_estimate(self, text: str) -> None:
+        self.lbl_estimate.setText(text)
+        self.btn_estimate.setEnabled(True)
+
     def _recompute(self) -> None:
         """Re-run the DFT on the last scan's RAW interferogram with the current
         settings (FT region, apodization, λ, denoise) -- no re-scan. Lets you
@@ -1348,6 +1446,9 @@ class MeasurePanel(QWidget):
             svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
             ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
             center_method=self._center_method(),
+            # Raw is full-res; bin per the current Binning setting for the DFT
+            # (set Binning=1 to recompute at full spatial resolution).
+            bin=self.spin_bin.value(),
         )
         # Keep the saved metadata in step with what was recomputed.
         self._scan_meta.update(
@@ -1368,12 +1469,15 @@ class MeasurePanel(QWidget):
             proc = HyperspectralProcessor()
             cubes, masks, wls = [], [], None
             for positions, datacube in zip(self.raw_positions, self.raw_cubes):
-                datacube = np.asarray(datacube)
+                # Raw is full-res; bin only for the DFT (Binning=1 -> full res).
+                datacube = self._bin_cube(np.asarray(datacube), p["bin"])
                 sat_mask = None
                 if p["sat_on"]:
                     sat_src = datacube
                     if self.background_subtracted and self.background_map is not None:
-                        sat_src = datacube + self.background_map[None, :, :]
+                        bgm = self._bin_cube(
+                            np.asarray(self.background_map)[None], p["bin"])[0]
+                        sat_src = datacube + bgm[None, :, :]
                     sat_mask = saturation_mask(sat_src, p["sat_level"])
                 n_freq = resolve_n_points(len(positions), manual=p["nfreq"])
                 wl, cube = proc.compute_hyperspectral(
@@ -1461,7 +1565,11 @@ class MeasurePanel(QWidget):
                     z_value_mm=(None if z_value is None else float(z_value)),
                     angle_index=(None if a_index is None else int(a_index)),
                     angle_value_deg=(None if a_value is None else float(a_value)),
-                    saved_local_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    saved_local_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    # raw_interferogram is stored at FULL spatial resolution;
+                    # binning was applied only to the spectrum_cube.
+                    raw_binning=1,
+                    spectrum_binning=int(getattr(self, "_scan_bin", 1)))
         if has_spectrum:
             cube = np.asarray(cube)
             meta.update(processing_stage="complete",
@@ -1517,9 +1625,15 @@ class MeasurePanel(QWidget):
             if bg is not None:
                 _roi = p["roi"]
                 _crop = bg if _roi is None else bg[_roi[0]:_roi[1], _roi[2]:_roi[3]]
-                self.background_map = bin_image(np.asarray(_crop, dtype=np.float32), p["bin"])
+                # FULL-resolution background (aligns with the full-res raw cube we
+                # save); a binned copy is used only for the binned spectrum's
+                # saturation check.
+                self.background_map = np.asarray(_crop, dtype=np.float32)
+                self.background_map_binned = self._bin_cube(
+                    self.background_map[None], p["bin"])[0]
             else:
                 self.background_map = None
+                self.background_map_binned = None
             # Scan axes. [None] means "that axis is not scanned" -> a single
             # position. The full acquisition is the NESTED grid: outer Z, inner
             # angle (for each Z, sweep every angle).
@@ -1579,9 +1693,12 @@ class MeasurePanel(QWidget):
                             f"pt {_g+1}/{_t} {_l}: cube point {i}/{tot}")
                         self.sig_point.emit(float(pos), float(value), i == 1)
 
+                    # Acquire the raw interferogram at FULL spatial resolution
+                    # (bin_factor=1). Binning is applied later, only for the
+                    # spectral DFT, so the saved raw keeps full resolution.
                     positions, datacube = scanner.scan_cube(
                         p["start"], p["stop"], p["n"], p["roi"],
-                        frames_avg=p["frames"], bin_factor=p["bin"], background=bg_for_scan,
+                        frames_avg=p["frames"], bin_factor=1, background=bg_for_scan,
                         progress=prog, should_abort=lambda: self._abort,
                         status_cb=lambda m: self.sig_status.emit(m))
 
@@ -1638,21 +1755,24 @@ class MeasurePanel(QWidget):
                 z, zi = item["z"], item["zi"]
                 a, ai = item["a"], item["ai"]
                 positions, datacube = item["positions"], item["datacube"]
+                # datacube is FULL resolution. Bin ONLY for the spectral DFT (and
+                # its saturation mask); the raw saved below stays full-res.
+                datacube_binned = self._bin_cube(datacube, p["bin"])
                 # Saturation mask from the RAW counts: if a background was
                 # subtracted, add it back so a clipped pixel still reads >= the
                 # saturation level (otherwise subtraction would mask it).
                 sat_mask = None
                 if p["sat_on"]:
-                    sat_src = datacube
-                    if self.background_subtracted and self.background_map is not None:
-                        sat_src = datacube + self.background_map[None, :, :]
+                    sat_src = datacube_binned
+                    if self.background_subtracted and self.background_map_binned is not None:
+                        sat_src = datacube_binned + self.background_map_binned[None, :, :]
                     sat_mask = saturation_mask(sat_src, p["sat_level"])
                 # "Auto" (nfreq == 0) -> ZEROFILL_FACTOR x steps, clamped.
                 n_freq = resolve_n_points(len(positions), manual=p["nfreq"])
                 self.sig_status.emit(
                     f"FFT {k+1}/{n_acq}: per-pixel DFT ({n_freq} bins)...")
                 wl, cube = proc.compute_hyperspectral(
-                    positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
+                    positions, datacube_binned, wl_start=p["wl0"], wl_stop=p["wl1"],
                     apod_width=p["apod"], n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],

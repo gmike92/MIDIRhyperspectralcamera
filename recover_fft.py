@@ -68,17 +68,36 @@ def recover_file(path, dest_dir, proc):
     nfreq_set = int(meta.get("n_freq_setting", 0) or 0)
     n_freq = resolve_n_points(len(positions), manual=nfreq_set)
 
-    # --- saturation mask, EXACTLY as the acquisition phase 2 does ---
+    # Binning is applied ONLY to compute the spectrum; the raw stays full-res.
+    # New files carry raw_binning=1 (raw is full-res -> bin here by
+    # spectrum_binning). Old files have no raw_binning and their raw is ALREADY
+    # binned -> do NOT bin again.
+    from instruments.subtwinslv import bin_image
+    def _bin_cube(c, f):
+        c = np.asarray(c)
+        if f is None or int(f) <= 1 or c.ndim != 3:
+            return c
+        f = int(f)
+        return np.stack([bin_image(c[i], f) for i in range(c.shape[0])])
+    if int(meta.get("raw_binning", 0) or 0) == 1:
+        binf = int(meta.get("spectrum_binning", meta.get("binning", 1)) or 1)
+    else:
+        binf = 1   # legacy: raw already binned
+    dcb = _bin_cube(datacube, binf)
+    bg_binned = (_bin_cube(np.asarray(background, dtype=float)[None], binf)[0]
+                 if background is not None else None)
+
+    # --- saturation mask (on the binned spectrum geometry) ---
     sat_mask = None
     if meta.get("saturation_masking"):
-        sat_src = datacube
-        if bg_sub and background is not None:
-            sat_src = datacube + np.asarray(background, dtype=float)[None, :, :]
+        sat_src = dcb
+        if bg_sub and bg_binned is not None:
+            sat_src = dcb + bg_binned[None, :, :]
         sat_mask = saturation_mask(sat_src, meta.get("saturation_level", 16383))
 
     # --- the per-pixel DFT (motor calibration applied inside, positions raw) ---
     wl, cube = proc.compute_hyperspectral(
-        positions, datacube, wl_start=wl0, wl_stop=wl1,
+        positions, dcb, wl_start=wl0, wl_stop=wl1,
         apod_width=apod_width, n_freq=n_freq,
         expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
         apod_type=apod_type, walkoff=walkoff,
@@ -93,6 +112,7 @@ def recover_file(path, dest_dir, proc):
     meta.update(processing_stage="complete",
                 cube_shape=list(np.asarray(cube).shape), n_freq=int(cube.shape[0]),
                 wl_min_um=float(np.min(wl)), wl_max_um=float(np.max(wl)),
+                raw_binning=1, spectrum_binning=int(binf),
                 recovered_from_raw=True,
                 recovered_local_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     kw = dict(

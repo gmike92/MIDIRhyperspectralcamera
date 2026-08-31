@@ -266,6 +266,13 @@ class MainWindow(QMainWindow):
         scroll.setWidget(container)
         return scroll
 
+    def _is_goldeye_mode(self) -> bool:
+        """The SP1203/Goldeye-specific controls (option dropdowns, 1 s log
+        integration slider) apply only to these modes; the IRC806 keeps its
+        original UI."""
+        return (self.current_mode or "").lower() in (
+            "ophir", "sp1203", "goldeye", "gige", "beamgage")
+
     def _build_badpixel_group(self) -> QGroupBox:
         group = QGroupBox("Bad pixels (cold/hot)")
         v = QVBoxLayout(group)
@@ -449,16 +456,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)
 
-        # Integration time. LOG-scale slider spanning the full range (1 us .. 1 s)
-        # so both very short and long integrations are reachable; the spin box
-        # gives exact entry. The backend clamps to what the camera accepts.
-        self.INT_MIN_MS, self.INT_MAX_MS = 0.001, 1000.0
+        # Integration time. Goldeye/SP1203: LOG-scale 1 us .. 1 s. IRC806 (and
+        # other modes): the ORIGINAL linear 0.01 .. 8 ms (1 frame at 120 Hz) --
+        # so the IRC806 is operated exactly as before the Goldeye was added.
+        goldeye = self._is_goldeye_mode()
+        self._int_log = goldeye
+        if goldeye:
+            self.INT_MIN_MS, self.INT_MAX_MS, self._int_decimals = 0.001, 1000.0, 3
+        else:
+            self.INT_MIN_MS, self.INT_MAX_MS, self._int_decimals = 0.01, 8.0, 2
         self.integration_label = QLabel("Integration time: 0.30 ms")
         self.integration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.integration_slider.setRange(0, 1000)   # log-mapped to INT_MIN..MAX ms
+        self.integration_slider.setRange(0, 1000)   # mapped to INT_MIN..MAX ms
         self.integration_slider.valueChanged.connect(self.on_integration_slider_changed)
         self.integration_spin = QDoubleSpinBox()
-        self.integration_spin.setDecimals(3)
+        self.integration_spin.setDecimals(self._int_decimals)
         self.integration_spin.setRange(self.INT_MIN_MS, self.INT_MAX_MS)
         self.integration_spin.setSingleStep(0.05)
         self.integration_spin.valueChanged.connect(self.on_integration_spin_changed)
@@ -474,37 +486,40 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Averaging"))
         layout.addWidget(self.average_spin)
 
-        # -- SP1203 / Goldeye GenICam options (no-ops on the IRC806) ----------
-        layout.addWidget(QLabel("— SP1203 / Goldeye options —"))
+        # -- SP1203 / Goldeye GenICam options: shown ONLY in Goldeye/Ophir mode,
+        # so the IRC806 UI is unchanged from before the Goldeye was added.
         self.opt_combos = {}
-        for label, node, options in (
-            ("Integration mode", "IntegrationMode",
-             ["IntegrateThenRead", "IntegrateWhileRead"]),
-            ("Auto exposure", "ExposureAuto", ["Off", "Once", "Continuous"]),
-            ("Sensor gain", "SensorGain", ["Gain0", "Gain1", "Gain2"]),
-        ):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            cb = QComboBox()
-            cb.addItems(options)
-            cb.currentTextChanged.connect(
-                lambda val, n=node: self.control_queue.put(
-                    {"type": "set_option", "name": n, "value": val}))
-            row.addWidget(cb)
-            layout.addLayout(row)
-            self.opt_combos[node] = cb
+        self.framerate_spin = None
+        if goldeye:
+            layout.addWidget(QLabel("— SP1203 / Goldeye options —"))
+            for label, node, options in (
+                ("Integration mode", "IntegrationMode",
+                 ["IntegrateThenRead", "IntegrateWhileRead"]),
+                ("Auto exposure", "ExposureAuto", ["Off", "Once", "Continuous"]),
+                ("Sensor gain", "SensorGain", ["Gain0", "Gain1", "Gain2"]),
+            ):
+                row = QHBoxLayout()
+                row.addWidget(QLabel(label))
+                cb = QComboBox()
+                cb.addItems(options)
+                cb.currentTextChanged.connect(
+                    lambda val, n=node: self.control_queue.put(
+                        {"type": "set_option", "name": n, "value": val}))
+                row.addWidget(cb)
+                layout.addLayout(row)
+                self.opt_combos[node] = cb
 
-        fr_row = QHBoxLayout()
-        fr_row.addWidget(QLabel("Frame rate (Hz)"))
-        self.framerate_spin = QDoubleSpinBox()
-        self.framerate_spin.setRange(0.03, 231.0)
-        self.framerate_spin.setDecimals(2)
-        self.framerate_spin.setValue(30.0)
-        self.framerate_spin.valueChanged.connect(
-            lambda v: self.control_queue.put(
-                {"type": "set_option", "name": "AcquisitionFrameRate", "value": float(v)}))
-        fr_row.addWidget(self.framerate_spin)
-        layout.addLayout(fr_row)
+            fr_row = QHBoxLayout()
+            fr_row.addWidget(QLabel("Frame rate (Hz)"))
+            self.framerate_spin = QDoubleSpinBox()
+            self.framerate_spin.setRange(0.03, 231.0)
+            self.framerate_spin.setDecimals(2)
+            self.framerate_spin.setValue(30.0)
+            self.framerate_spin.valueChanged.connect(
+                lambda v: self.control_queue.put(
+                    {"type": "set_option", "name": "AcquisitionFrameRate", "value": float(v)}))
+            fr_row.addWidget(self.framerate_spin)
+            layout.addLayout(fr_row)
 
         start_button = QPushButton("Start")
         start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
@@ -771,15 +786,22 @@ class MainWindow(QMainWindow):
 
     def _ms_to_slider(self, ms: float) -> int:
         ms = float(np.clip(ms, self.INT_MIN_MS, self.INT_MAX_MS))
-        frac = np.log10(ms / self.INT_MIN_MS) / np.log10(self.INT_MAX_MS / self.INT_MIN_MS)
+        if getattr(self, "_int_log", True):
+            frac = np.log10(ms / self.INT_MIN_MS) / np.log10(self.INT_MAX_MS / self.INT_MIN_MS)
+        else:
+            frac = (ms - self.INT_MIN_MS) / (self.INT_MAX_MS - self.INT_MIN_MS)
         return int(round(frac * 1000.0))
 
     def _slider_to_ms(self, s: int) -> float:
-        return float(self.INT_MIN_MS * (self.INT_MAX_MS / self.INT_MIN_MS) ** (s / 1000.0))
+        frac = s / 1000.0
+        if getattr(self, "_int_log", True):
+            return float(self.INT_MIN_MS * (self.INT_MAX_MS / self.INT_MIN_MS) ** frac)
+        return float(self.INT_MIN_MS + frac * (self.INT_MAX_MS - self.INT_MIN_MS))
 
     def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
         integration_ms = float(np.clip(integration_ms, self.INT_MIN_MS, self.INT_MAX_MS))
-        self.integration_label.setText(f"Integration time: {integration_ms:.3f} ms")
+        dec = getattr(self, "_int_decimals", 2)
+        self.integration_label.setText(f"Integration time: {integration_ms:.{dec}f} ms")
 
         slider_value = self._ms_to_slider(integration_ms)
         if self.integration_slider.value() != slider_value:

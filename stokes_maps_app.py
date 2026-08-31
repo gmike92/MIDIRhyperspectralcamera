@@ -82,6 +82,22 @@ def _load_meas_npz(path):
     return dict(raw=raw, pos=pos, cal=bool(cal), wl=wl)
 
 
+def _read_z(path):
+    """The z position (mm) of a measurement .npz, from `z_value_mm` or metadata;
+    0.0 if absent. Reads only the small member, not the big cube."""
+    try:
+        with np.load(path, allow_pickle=True) as d:
+            if "z_value_mm" in d.files:
+                return float(np.asarray(d["z_value_mm"]))
+            if "metadata" in d.files:
+                m = dict(d["metadata"].item())
+                if m.get("z_value_mm") is not None:
+                    return float(m["z_value_mm"])
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
 def _bwr_cmap():
     """Diverging blue-white-red (blue = low / -pi, white = 0, red = high / +pi)."""
     return pg.ColorMap(pos=[0.0, 0.5, 1.0],
@@ -135,13 +151,14 @@ def _nanmax_safe(a, default=1.0):
     return float(finite.max()) if finite.size else default
 
 
-# Stokes titles. M_k = amplitude map k, phi_k = phase map k. The magnitude is
-# |S_i| = sqrt(clip(S_i^2, 0)); the SIGNED value multiplies it by a per-pixel
-# sign taken from the expressions the user specified.
+# Stokes titles. |S_i| = sqrt(clip(S_i^2, 0)) from the phase-free magnitudes;
+# the SIGNED value takes the sign from the phase-corrected quadratures G_k
+# (S1=ReG2=ImG3, S2=ReG1=ReG3, S3=ImG1=-ImG2), choosing the reading whose
+# competing Stokes parameter is smaller.
 TITLES_SIGNED = [
-    "S₁ = sgn(M₂+φ₃)·√[½(M₂² + M₃² − M₁²)]",
-    "S₂ = sgn(M₁+M₃)·√[½(M₁² + M₃² − M₂²)]",
-    "S₃ = sgn(φ₁−φ₂)·√[½(M₁² + M₂² − M₃²)]",
+    "S₁ = sign(Re G₂ | Im G₃)·|S₁|",
+    "S₂ = sign(Re G₁ | Re G₃)·|S₂|",
+    "S₃ = sign(Im G₁ | −Im G₂)·|S₃|",
 ]
 TITLES_UNSIGNED = [
     "|S₁| = √[½(M₂² + M₃² − M₁²)]",
@@ -155,12 +172,16 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Stokes from hypercubes (phase-free, per-λ DFT)")
         self.resize(1300, 940)
-        self.slots = [None, None, None]     # dict(raw,pos,cal,wl,name) or None
-        self.ref = None                     # 4th cube for phasing, or None
-        self.i45 = None                     # optional separate cube whose |field| is I45
+        # Each source is a folder of per-z measurements: dict(zpaths={z: path},
+        # name, cache=(z, meas)). A single file is just a 1-entry folder.
+        self.slots = [None, None, None]     # source dict or None (M1, M2, M3)
+        self.ref = None                     # phasing / polarizer source, or None
+        self.i45 = None                     # optional separate I45 source
         self._i45_amp = None                # I45 amplitude at the current lambda
+        self._setting_levels = False        # guard: programmatic vs user cbar changes
         self.proc = None                    # HyperspectralProcessor (lazy)
         self.wl = None                      # wavelength axis for the slider
+        self._z_axis = []                   # shared z positions across all sources
         self._last_dir = "D:\\CAMERA" if os.path.isdir("D:\\CAMERA") else ""
         self._timer = QtCore.QTimer(self)
         self._timer.setSingleShot(True); self._timer.setInterval(200)
@@ -177,17 +198,21 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout()
         self.slot_lbl = []
         for k in range(3):
-            b = QtWidgets.QPushButton(f"Load M{k+1} (.npz)\u2026")
-            b.clicked.connect(lambda _c, kk=k: self._load_slot(kk))
+            b = self._load_button(f"Load M{k+1} \u25be",
+                                  lambda _c=False, kk=k: self._load_slot(kk, False),
+                                  lambda _c=False, kk=k: self._load_slot(kk, True),
+                                  "Single .npz, or a folder of per-z .npz for this "
+                                  "configuration.")
             top.addWidget(b)
             lbl = QtWidgets.QLabel("(empty)"); lbl.setStyleSheet("color:#888;")
             top.addWidget(lbl); self.slot_lbl.append(lbl)
         top.addSpacing(16)
-        b_ref = QtWidgets.QPushButton("Load phasing ref (.npz)\u2026")
-        b_ref.setToolTip("Optional 4th hypercube: its raw interferogram is used as "
-                         "the background for per-pixel phase correction (same as the "
-                         "analysis_app Phase panel).")
-        b_ref.clicked.connect(self._load_ref)
+        b_ref = self._load_button("Load phasing \u25be",
+                                  lambda _c=False: self._load_ref(False),
+                                  lambda _c=False: self._load_ref(True),
+                                  "Optional polarizer/phasing source (file or per-z "
+                                  "folder): the phase-correction reference (and, by "
+                                  "default, the I\u2084\u2085 source).")
         top.addWidget(b_ref)
         self.ref_lbl = QtWidgets.QLabel("phasing: none"); self.ref_lbl.setStyleSheet("color:#888;")
         top.addWidget(self.ref_lbl)
@@ -215,10 +240,11 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         self.combo_i45src.addItems(["phasing ref", "separate cube"])
         self.combo_i45src.currentIndexChanged.connect(self._schedule)
         s0row.addWidget(self.combo_i45src)
-        b_i45 = QtWidgets.QPushButton("Load I₄₅ cube (.npz)…")
-        b_i45.setToolTip("Load a separate hypercube whose |field| is used as I₄₅ "
-                         "(only used when 'I₄₅ from' = separate cube).")
-        b_i45.clicked.connect(self._load_i45)
+        b_i45 = self._load_button("Load I₄₅ ▾",
+                                  lambda _c=False: self._load_i45(False),
+                                  lambda _c=False: self._load_i45(True),
+                                  "Separate source (file or per-z folder) whose |field| "
+                                  "is I₄₅ (only used when 'I₄₅ from' = separate cube).")
         s0row.addWidget(b_i45)
         self.i45_lbl = QtWidgets.QLabel("I₄₅: none"); self.i45_lbl.setStyleSheet("color:#888;")
         s0row.addWidget(self.i45_lbl)
@@ -240,6 +266,17 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         s0row.addWidget(self.chk_showmask)
         s0row.addStretch(1)
         root.addLayout(s0row)
+
+        # --- z slider (shared across all folders) ---
+        zrow = QtWidgets.QHBoxLayout()
+        zrow.addWidget(QtWidgets.QLabel("z:"))
+        self.sl_z = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.sl_z.setEnabled(False)
+        self.sl_z.valueChanged.connect(self._on_z)
+        zrow.addWidget(self.sl_z, 1)
+        self.lbl_z = QtWidgets.QLabel("-- mm"); self.lbl_z.setStyleSheet("font-weight:600;")
+        zrow.addWidget(self.lbl_z)
+        root.addLayout(zrow)
 
         # --- wavelength slider ---
         wlrow = QtWidgets.QHBoxLayout()
@@ -272,6 +309,13 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             s.valueChanged.connect(self._schedule)
         ctl.addWidget(self.sp_ft0); ctl.addWidget(QtWidgets.QLabel("to")); ctl.addWidget(self.sp_ft1)
         ctl.addSpacing(12)
+        self.chk_phaseamp = QtWidgets.QCheckBox("Phase × amp")
+        self.chk_phaseamp.setToolTip("Weight each column's phase (row 2) by its own "
+                                     "normalised amplitude, so low-amplitude pixels "
+                                     "(where the phase is meaningless) fade to 0.")
+        self.chk_phaseamp.toggled.connect(self._refresh_phase)
+        ctl.addWidget(self.chk_phaseamp)
+        ctl.addSpacing(12)
         ctl.addWidget(QtWidgets.QLabel("Stokes"))
         self.combo_mode = QtWidgets.QComboBox()
         self.combo_mode.addItems(["Signed Stokes parameters", "Unsigned Stokes parameters"])
@@ -281,6 +325,13 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             "Unsigned: the magnitudes |Sᵢ| only.")
         self.combo_mode.currentIndexChanged.connect(self._recompute_stokes_only)
         ctl.addWidget(self.combo_mode)
+        self.chk_sauto = QtWidgets.QCheckBox("Auto scale")
+        self.chk_sauto.setChecked(True)
+        self.chk_sauto.setToolTip("Auto-scale the last-row (Stokes) colorbars "
+                                  "(normalised = −1…1). Uncheck — or just drag a "
+                                  "colorbar — to set and keep a custom stretch.")
+        self.chk_sauto.toggled.connect(self._recompute_stokes_only)
+        ctl.addWidget(self.chk_sauto)
         ctl.addStretch(1)
         root.addLayout(ctl)
 
@@ -326,7 +377,9 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             self.ph_img.append(img); self.ph_cbar.append(cbar); self.ph_title.append(lbl)
             grid.addWidget(glw, 1, k + 1); _reg(f"M{k+1}_phase", f"M{k+1} phase", img, glw)
         for k in range(3):
-            glw, img, cbar, lbl = self._make_panel(TITLES_SIGNED[k], bwr, title_size="9pt")
+            glw, img, cbar, lbl = self._make_panel(TITLES_SIGNED[k], bwr, title_size="9pt",
+                                                   interactive=True)   # draggable levels
+            cbar.sigLevelsChanged.connect(self._on_stokes_levels)
             self.s_img.append(img); self.s_cbar.append(cbar); self.s_title.append(lbl)
             grid.addWidget(glw, 2, k + 1); _reg(f"S{k+1}", f"S{k+1}", img, glw)
         for r in range(3):
@@ -335,75 +388,155 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             grid.setColumnStretch(c, 1)
         root.addWidget(gridw, 1)
 
-    def _make_panel(self, title, cmap, title_size=None):
+    def _load_button(self, text, on_file, on_folder, tip=""):
+        """A tool button with a File / Folder dropdown (like analysis_app)."""
+        btn = QtWidgets.QToolButton()
+        btn.setText(text)
+        btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        if tip:
+            btn.setToolTip(tip)
+        menu = QtWidgets.QMenu(btn)
+        menu.addAction("Single file…").triggered.connect(on_file)
+        menu.addAction("Folder (per-z)…").triggered.connect(on_folder)
+        btn.setMenu(menu)
+        return btn
+
+    def _make_panel(self, title, cmap, title_size=None, interactive=False):
         glw = pg.GraphicsLayoutWidget()
         glw.addLabel(title, row=0, col=0, colspan=2, size=title_size or "11pt")
         vb = glw.addViewBox(row=1, col=0)
         vb.setAspectLocked(True); vb.invertY(True)
         lbl = glw.getItem(0, 0)
         img = pg.ImageItem(); vb.addItem(img)
-        cbar = pg.ColorBarItem(interactive=False, colorMap=cmap)
+        cbar = pg.ColorBarItem(interactive=interactive, colorMap=cmap)
         glw.addItem(cbar, row=1, col=1); cbar.setImageItem(img)
         return glw, img, cbar, lbl
 
     # -------------------------------------------------------------- loading
-    def _load_slot(self, k):
+    def _pick_folder_source(self, title):
+        """Scan a chosen folder for per-z .npz files -> source dict, or None."""
+        import glob
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, title, self._last_dir)
+        if not folder:
+            return None
+        npz = sorted(glob.glob(os.path.join(folder, "*.npz")))
+        if not npz:
+            QtWidgets.QMessageBox.warning(self, "No data", "No .npz files in that folder.")
+            return None
+        zpaths = {}
+        for p in npz:
+            zpaths[round(_read_z(p), 4)] = p           # {z_mm: path}; dupes -> last wins
+        self._last_dir = folder
+        return dict(zpaths=zpaths,
+                    name=os.path.basename(os.path.normpath(folder)) or folder,
+                    cache=None)
+
+    def _pick_file_source(self, title):
+        """Pick a single .npz -> a 1-entry source dict (z from its z_value_mm)."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, f"Load measurement M{k+1} (.npz)", self._last_dir,
-            "Hypercube (*.npz);;All files (*)")
+            self, title, self._last_dir, "Hypercube (*.npz);;All files (*)")
         if not path:
-            return
-        try:
-            slot = _load_meas_npz(path)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Could not load hypercube",
-                                           f"{os.path.basename(path)}:\n{e}")
-            return
-        slot["name"] = os.path.basename(path)
+            return None
         self._last_dir = os.path.dirname(path)
-        self.slots[k] = slot
-        self.slot_lbl[k].setText(f"{slot['name']}  {slot['raw'].shape}")
-        self.slot_lbl[k].setStyleSheet("color:#2f9e44;")
-        self._init_axes_from(slot)
+        return dict(zpaths={round(_read_z(path), 4): path},
+                    name=os.path.basename(path), cache=None)
+
+    def _pick_source(self, folder, title):
+        return (self._pick_folder_source(title) if folder
+                else self._pick_file_source(title))
+
+    def _src_label(self, src):
+        n = len(src["zpaths"])
+        return f"{src['name']}  ({n} z)" if n != 1 else src["name"]
+
+    def _after_source_loaded(self, src):
+        self._rebuild_z_axis()
+        if self.wl is None:                            # init λ / FT axes once
+            try:
+                self._init_axes_from(_load_meas_npz(next(iter(src["zpaths"].values()))))
+            except Exception:  # noqa: BLE001
+                pass
         self._recompute()
 
-    def _load_ref(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load phasing reference (.npz)", self._last_dir,
-            "Hypercube (*.npz);;All files (*)")
-        if not path:
+    def _load_slot(self, k, folder):
+        src = self._pick_source(folder, f"Load M{k+1} {'folder' if folder else 'file'}")
+        if src is None:
             return
-        try:
-            self.ref = _load_meas_npz(path)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Could not load reference", f"{e}")
+        self.slots[k] = src
+        self.slot_lbl[k].setText(self._src_label(src))
+        self.slot_lbl[k].setStyleSheet("color:#2f9e44;")
+        self._after_source_loaded(src)
+
+    def _load_ref(self, folder):
+        src = self._pick_source(folder, "Load phasing / polarizer "
+                                + ("folder" if folder else "file"))
+        if src is None:
             return
-        self.ref["name"] = os.path.basename(path)
-        self._last_dir = os.path.dirname(path)
-        self.ref_lbl.setText(f"phasing: {self.ref['name']}  {self.ref['raw'].shape}")
+        self.ref = src
+        self.ref_lbl.setText("phasing: " + self._src_label(src))
         self.ref_lbl.setStyleSheet("color:#2f9e44;")
         self.chk_phase.setEnabled(True)
         self.chk_phase.blockSignals(True); self.chk_phase.setChecked(True)
         self.chk_phase.blockSignals(False)
-        self._recompute()
+        self._after_source_loaded(src)
 
-    def _load_i45(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load I₄₅ cube (.npz)", self._last_dir,
-            "Hypercube (*.npz);;All files (*)")
-        if not path:
+    def _load_i45(self, folder):
+        src = self._pick_source(folder, "Load I₄₅ " + ("folder" if folder else "file"))
+        if src is None:
             return
-        try:
-            self.i45 = _load_meas_npz(path)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Could not load I45 cube", f"{e}")
-            return
-        self.i45["name"] = os.path.basename(path)
-        self._last_dir = os.path.dirname(path)
-        self.i45_lbl.setText(f"I₄₅: {self.i45['name']}  {self.i45['raw'].shape}")
+        self.i45 = src
+        self.i45_lbl.setText("I₄₅: " + self._src_label(src))
         self.i45_lbl.setStyleSheet("color:#2f9e44;")
-        self.combo_i45src.setCurrentIndex(1)          # -> use the separate cube
-        self._recompute()
+        self.combo_i45src.setCurrentIndex(1)          # -> use the separate source
+        self._after_source_loaded(src)
+
+    # -- shared z axis + per-source resolution ------------------------------
+    def _rebuild_z_axis(self):
+        zs = set()
+        for s in list(self.slots) + [self.ref, self.i45]:
+            if s:
+                zs.update(s["zpaths"].keys())
+        self._z_axis = sorted(zs)
+        n = len(self._z_axis)
+        self.sl_z.blockSignals(True)
+        self.sl_z.setEnabled(n > 1)
+        self.sl_z.setMinimum(0); self.sl_z.setMaximum(max(0, n - 1))
+        if self.sl_z.value() > max(0, n - 1):
+            self.sl_z.setValue(0)
+        self.sl_z.blockSignals(False)
+        self._update_z_label()
+
+    def _current_z(self):
+        if not self._z_axis:
+            return None
+        return self._z_axis[int(np.clip(self.sl_z.value(), 0, len(self._z_axis) - 1))]
+
+    def _update_z_label(self):
+        z = self._current_z()
+        self.lbl_z.setText(f"{z:.4f} mm" if z is not None else "-- mm")
+
+    def _on_z(self, *a):
+        self._update_z_label()
+        self._schedule()
+
+    def _resolve(self, source, z):
+        """The measurement dict for a source at the z nearest the target (within
+        1 µm), loading + caching the current z's file lazily."""
+        if source is None or z is None or not source["zpaths"]:
+            return None
+        best = min(source["zpaths"], key=lambda zz: abs(zz - z))
+        if abs(best - z) > 1e-3:
+            return None
+        c = source.get("cache")
+        if c and c[0] == best:
+            return c[1]
+        try:
+            meas = _load_meas_npz(source["zpaths"][best])
+        except Exception:  # noqa: BLE001
+            return None
+        source["cache"] = (best, meas)
+        return meas
 
     def _init_axes_from(self, slot):
         """Set the λ slider range + FT-window defaults from the first cube loaded."""
@@ -448,6 +581,7 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         lam = self._current_lambda()
         if lam is None:
             return
+        z = self._current_z()
         if self.proc is None:
             self.proc = HyperspectralProcessor()
         apod = self.combo_apod.currentText()
@@ -455,15 +589,17 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                   else "envelope")
         ftwin = ((self.sp_ft0.value(), self.sp_ft1.value())
                  if self.chk_ftwin.isChecked() else None)
-        phasing = self.chk_phase.isChecked() and self.ref is not None
+        # phasing reference measurement at this z (folder resolved).
+        ref_meas = self._resolve(self.ref, z)
+        phasing = self.chk_phase.isChecked() and ref_meas is not None
         maskpct = self.sp_mask.value()
         notes = []
 
-        def _dft(src, ref_raw=None):
+        def _dft(meas, ref_raw=None):
             c, _ = self.proc.compute_complex_map(
-                src["pos"], src["raw"], lam, apod_type=apod, ft_window_mm=ftwin,
+                meas["pos"], meas["raw"], lam, apod_type=apod, ft_window_mm=ftwin,
                 expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-                positions_calibrated=src["cal"], reference_cube=ref_raw,
+                positions_calibrated=meas["cal"], reference_cube=ref_raw,
                 center_method=center)
             return c
 
@@ -471,16 +607,17 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         # (Magnitude is unchanged by phasing, so no reference is applied here.)
         self._i45_amp = None
         self._i45_valid = None
+        self._i45_phase = None
         gmask = None
-        src = self._i45_source()
-        if src is not None:
+        i45_meas = self._resolve(self._i45_source(), z)
+        if i45_meas is not None:
             try:
-                c45 = _dft(src)
+                c45 = _dft(i45_meas)
             except Exception as e:  # noqa: BLE001
                 c45 = None; notes.append(f"I₄₅: {e}")
             if c45 is not None:
                 self._i45_amp = np.abs(c45).astype(np.float64)
-                i45_ph = np.angle(c45).astype(np.float64)
+                self._i45_phase = np.angle(c45).astype(np.float64)
                 pk = _robust_peak(self._i45_amp)
                 v = np.isfinite(self._i45_amp)
                 if maskpct > 0 and pk > 0:
@@ -489,30 +626,29 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                 gmask = v
                 self.i45_amp_img.setImage(self._i45_amp, autoLevels=False)
                 self.i45_amp_cbar.setLevels((0.0, pk if pk > 0 else 1.0))
-                self.i45_ph_img.setImage(np.where(v, i45_ph, np.nan),
-                                         autoLevels=False, levels=(-np.pi, np.pi))
-                self.i45_ph_cbar.setLevels((-np.pi, np.pi)); _set_pi_ticks(self.i45_ph_cbar)
         if self._i45_amp is None:
             self.i45_amp_img.clear(); self.i45_ph_img.clear()
             self.i45_amp_ov.setVisible(False)
 
         prepared = []
         for k in range(3):
-            slot = self.slots[k]
-            if slot is None:
+            meas = self._resolve(self.slots[k], z)
+            if meas is None:
                 self.amp_img[k].clear(); self.ph_img[k].clear()
                 self.amp_title[k].setText(f"M{k+1}")
+                if self.slots[k] is not None:
+                    notes.append(f"M{k+1}: no file at z={z:.4f} mm")
                 prepared.append(None); continue
-            raw = slot["raw"]
+            raw = meas["raw"]
             ref_raw = None
             if phasing:
-                if self.ref["raw"].shape == raw.shape:
-                    ref_raw = self.ref["raw"]
+                if ref_meas["raw"].shape == raw.shape:
+                    ref_raw = ref_meas["raw"]
                 else:
-                    notes.append(f"M{k+1}: ref shape {self.ref['raw'].shape} ≠ "
+                    notes.append(f"M{k+1}: ref shape {ref_meas['raw'].shape} ≠ "
                                  f"{raw.shape}, phasing skipped")
             try:
-                cmap = _dft(slot, ref_raw)
+                cmap = _dft(meas, ref_raw)
             except Exception as e:  # noqa: BLE001
                 notes.append(f"M{k+1}: {e}")
                 prepared.append(None); continue
@@ -533,18 +669,16 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             peak = _robust_peak(amp)
             self.amp_img[k].setImage(amp, autoLevels=False)         # row 1: unmasked
             self.amp_cbar[k].setLevels((0.0, peak if peak > 0 else 1.0))
-            self.ph_img[k].setImage(np.where(valid, phase, np.nan),  # row 2: masked
-                                    autoLevels=False, levels=(-np.pi, np.pi))
-            self.ph_cbar[k].setLevels((-np.pi, np.pi)); _set_pi_ticks(self.ph_cbar[k])
             self.amp_title[k].setText(
                 f"M{k+1}  |field|" + ("  [phased]" if ref_raw is not None else ""))
-            prepared.append((amp, valid, phase))
+            prepared.append((amp, valid, phase, ref_raw is not None))
 
         self._prepared = prepared
         self._refresh_mask_overlay()
+        self._refresh_phase()          # row 2 (optionally amplitude-weighted)
         n_loaded = sum(p is not None for p in prepared)
-        base = (f"λ = {lam:.4f} µm   |   apod {apod}   |   centre {center}   |   "
-                f"{n_loaded}/3 maps"
+        base = (f"z = {z:.4f} mm   |   λ = {lam:.4f} µm   |   apod {apod}   |   "
+                f"centre {center}   |   {n_loaded}/3 maps"
                 + ("   |   phasing ON" if phasing else ""))
         if notes:
             base += "   |   " + "; ".join(notes)
@@ -576,6 +710,36 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             _tint(self.amp_mask_ov[k],
                   None if prep is None or prep[k] is None else prep[k][1])
 
+    @staticmethod
+    def _phase_disp(phase, amp, on):
+        """Optionally multiply the phase by its own normalised amplitude, so
+        pixels where |field| -> 0 (phase meaningless) fade toward 0."""
+        if not on:
+            return phase
+        pk = _robust_peak(amp)
+        if pk <= 0:
+            return phase
+        return phase * np.clip(amp / pk, 0.0, 1.0)
+
+    def _refresh_phase(self, *a):
+        """Redraw row 2 (phase) from the stored maps, applying the 'Phase × amp'
+        weighting per column. Cheap: no DFT recompute."""
+        on = self.chk_phaseamp.isChecked()
+        if getattr(self, "_i45_amp", None) is not None and self._i45_phase is not None:
+            d = self._phase_disp(self._i45_phase, self._i45_amp, on)
+            self.i45_ph_img.setImage(np.where(self._i45_valid, d, np.nan),
+                                     autoLevels=False, levels=(-np.pi, np.pi))
+            self.i45_ph_cbar.setLevels((-np.pi, np.pi)); _set_pi_ticks(self.i45_ph_cbar)
+        prep = getattr(self, "_prepared", None)
+        for k in range(3):
+            if prep is None or prep[k] is None:
+                self.ph_img[k].clear(); continue
+            amp, valid, phase = prep[k][0], prep[k][1], prep[k][2]
+            d = self._phase_disp(phase, amp, on)
+            self.ph_img[k].setImage(np.where(valid, d, np.nan),
+                                    autoLevels=False, levels=(-np.pi, np.pi))
+            self.ph_cbar[k].setLevels((-np.pi, np.pi)); _set_pi_ticks(self.ph_cbar[k])
+
     def _status(self, note):
         self.status.setText(getattr(self, "_status_base", "") + note)
 
@@ -596,12 +760,11 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                          "identical dimensions")
             return
 
-        # S0 needs a matching-shape I45 amplitude; normalisation divides by it.
+        # Signs come from the phase-corrected quadratures, so all three maps must
+        # have been phased against the polarizer scan (P_k = arg G_k).
         i45 = self._i45_amp
         have_i45 = i45 is not None and i45.shape == prepared[0][0].shape
-        normalize = self.chk_norm.isChecked() and have_i45
-        # Normalised Stokes are inherently signed; the toggle only matters otherwise.
-        signed = normalize or (self.combo_mode.currentIndex() == 0)
+        phased = all(len(p) > 3 and p[3] for p in prepared)
 
         M1, M2, M3 = (p[0] for p in prepared)
         P1, P2, P3 = (p[2] for p in prepared)
@@ -614,15 +777,31 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             self._status("   |   0 pixels pass the amplitude mask — lower 'Amp mask %'")
             return
 
+        # (iii) magnitudes from the phase-free equation.
         mag = [np.sqrt(np.clip(0.5 * (M2**2 + M3**2 - M1**2), 0.0, None)),
                np.sqrt(np.clip(0.5 * (M1**2 + M3**2 - M2**2), 0.0, None)),
                np.sqrt(np.clip(0.5 * (M1**2 + M2**2 - M3**2), 0.0, None))]
-        signs = [_sign(M2 + P3), _sign(M1 + M3), _sign(P1 - P2)]
-        s_signed = [mag[k] * signs[k] for k in range(3)]
 
-        # S0 = 2*I45 - S2, shown in the reference column whenever I45 is available.
-        s0 = (2.0 * i45 - s_signed[1]) if have_i45 else None
-        if have_i45:
+        # (iv) signs from the quadratures of G_k = F_k e^{-iΦ} (needs phasing).
+        #   S1 = Re G2 = Im G3 ;  S2 = Re G1 = Re G3 ;  S3 = Im G1 = -Im G2
+        # Each has two readings; keep the one whose competing Stokes is smaller
+        # (a residual phase error mixes the competitor into the wanted quadrature).
+        s_signed = None
+        if phased:
+            ReG = [M1 * np.cos(P1), M2 * np.cos(P2), M3 * np.cos(P3)]
+            ImG = [M1 * np.sin(P1), M2 * np.sin(P2), M3 * np.sin(P3)]
+            aS1, aS2, aS3 = mag                      # |S1|, |S2|, |S3|
+
+            def _pick(vA, cA, vB, cB):               # sign from the smaller competitor
+                return _sign(np.where(cA <= cB, vA, vB))
+            sg = [_pick(ReG[1], aS3, ImG[2], aS2),   # S1: Re G2 (|S3|) or Im G3 (|S2|)
+                  _pick(ReG[0], aS3, ReG[2], aS1),   # S2: Re G1 (|S3|) or Re G3 (|S1|)
+                  _pick(ImG[0], aS2, -ImG[1], aS1)]  # S3: Im G1 (|S2|) or -Im G2 (|S1|)
+            s_signed = [mag[k] * sg[k] for k in range(3)]
+
+        # (v) S0 = 2*I45 - S2 (signed), then P = |s|/S0. Both need signs + I45.
+        s0 = (2.0 * i45 - s_signed[1]) if (have_i45 and s_signed is not None) else None
+        if s0 is not None:
             s0_disp = np.where(combined, s0, np.nan)
             self.s0_img.setImage(s0_disp, autoLevels=False)
             hi0 = _nanmax_safe(s0_disp, default=1.0)
@@ -630,7 +809,14 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             self.s0_title.setText("S₀ = 2·I₄₅ − S₂", size="9pt")
         else:
             self.s0_img.clear()
-            self.s0_title.setText("S₀ (load I₄₅)", size="9pt")
+            self.s0_title.setText("S₀ (needs I₄₅ + phasing)", size="9pt")
+
+        want_signed = self.chk_norm.isChecked() or (self.combo_mode.currentIndex() == 0)
+        normalize = self.chk_norm.isChecked() and s0 is not None
+        signed = normalize or (want_signed and s_signed is not None)
+        note = ""
+        if want_signed and s_signed is None:
+            note = "  — signs need phasing (load polarizer ref + Apply phasing)"
 
         if normalize:
             eps = max(1e-12 * _nanmax_safe(np.abs(s0)), 1e-30)
@@ -638,6 +824,10 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             vals = [s_signed[k] / s0_safe for k in range(3)]
             titles = ["S₁/S₀", "S₂/S₀", "S₃/S₀"]
             cmap = _bwr_cmap()
+            dop = np.sqrt(sum(s_signed[k]**2 for k in range(3))) / s0_safe
+            dm = np.where(combined, dop, np.nan)
+            note = (f"  |  DOP P=|s|/S₀ median "
+                    f"{np.nanmedian(dm):.3f}" if np.isfinite(np.nanmedian(dm)) else note)
         elif signed:
             vals = s_signed
             titles = TITLES_SIGNED
@@ -647,21 +837,42 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             titles = TITLES_UNSIGNED
             cmap = pg.colormap.get("turbo")
 
-        for k in range(3):
-            self.s_title[k].setText(titles[k], size="9pt")
-            self.s_cbar[k].setColorMap(cmap)
-            img = np.where(combined, vals[k], np.nan)
-            self.s_img[k].setImage(img, autoLevels=False)
-            if normalize:                             # S_i/S0 is bounded to [-1, 1]
-                self.s_cbar[k].setLevels((-1.0, 1.0))
-            elif signed:                              # diverging, symmetric about 0
-                m = _nanmax_safe(np.abs(img), default=1.0)
-                self.s_cbar[k].setLevels((-m if m > 0 else -1.0, m if m > 0 else 1.0))
-            else:
-                hi = _nanmax_safe(img, default=1.0)
-                self.s_cbar[k].setLevels((0.0, hi if hi > 0 else 1.0))
-        self._status(f"   |   Stokes over {n_ok} px"
-                     + ("  (normalised S₁/S₀…)" if normalize else ""))
+        # Auto-scale sets the mode default each refresh; when off, the user's
+        # dragged/custom colorbar levels are preserved. Block the level signal so
+        # our own setLevels don't read as a user drag.
+        auto = self.chk_sauto.isChecked()
+        self._setting_levels = True
+        try:
+            for k in range(3):
+                self.s_title[k].setText(titles[k], size="9pt")
+                self.s_cbar[k].setColorMap(cmap)
+                img = np.where(combined, vals[k], np.nan)
+                self.s_img[k].setImage(img, autoLevels=False)
+                if not auto:
+                    continue                          # keep the user's stretch
+                if normalize:                         # S_i/S0 is bounded to [-1, 1]
+                    self.s_cbar[k].setLevels((-1.0, 1.0))
+                elif signed:                          # diverging, symmetric about 0
+                    m = _nanmax_safe(np.abs(img), default=1.0)
+                    self.s_cbar[k].setLevels((-m if m > 0 else -1.0, m if m > 0 else 1.0))
+                else:
+                    hi = _nanmax_safe(img, default=1.0)
+                    self.s_cbar[k].setLevels((0.0, hi if hi > 0 else 1.0))
+        finally:
+            self._setting_levels = False
+        self._status(f"   |   Stokes over {n_ok} px" + note
+                     + ("" if auto else "   |   custom Stokes scale"))
+
+    def _on_stokes_levels(self, *a):
+        """A user drag of a Stokes colorbar switches off auto-scaling so the
+        custom stretch persists across slider moves."""
+        if self._setting_levels:
+            return
+        if self.chk_sauto.isChecked():
+            self.chk_sauto.blockSignals(True); self.chk_sauto.setChecked(False)
+            self.chk_sauto.blockSignals(False)
+            self._status(self.status.text().split("   |   Stokes")[0]
+                         + "   |   custom Stokes scale")
 
     # --------------------------------------------------------------- export
     def _open_export_dialog(self):

@@ -720,7 +720,17 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.r_wl1 = QtWidgets.QDoubleSpinBox(); self.r_wl1.setRange(0.1, 100); self.r_wl1.setSuffix(" µm")
         self.r_nfreq = QtWidgets.QSpinBox(); self.r_nfreq.setRange(0, 8192)
         self.r_nfreq.setSpecialValueText("Auto")
-        for wdg in (self.r_apod, self.r_center, self.r_wl0, self.r_wl1, self.r_nfreq):
+        # Spatial binning (block-average NxN) applied to the raw interferogram
+        # before the DFT. The raw is saved full-resolution, so this lets you
+        # recompute the spectral hypercube at any binning (1 = full resolution).
+        self.r_bin = QtWidgets.QSpinBox(); self.r_bin.setRange(1, 32); self.r_bin.setValue(1)
+        self.r_bin.setPrefix("×")
+        self.r_bin.setToolTip(
+            "Spatial binning for recompute: block-average each raw frame NxN "
+            "before the per-pixel DFT. 1 = full spatial resolution. Higher = "
+            "coarser map, better SNR, faster.")
+        for wdg in (self.r_apod, self.r_center, self.r_wl0, self.r_wl1,
+                    self.r_nfreq, self.r_bin):
             sig = (wdg.currentTextChanged if isinstance(wdg, QtWidgets.QComboBox)
                    else wdg.valueChanged)
             sig.connect(self._recompute_if_on)
@@ -728,6 +738,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         form.addRow("Apod. centre", self.r_center)
         form.addRow("λ from", self.r_wl0); form.addRow("λ to", self.r_wl1)
         form.addRow("N freq", self.r_nfreq)
+        form.addRow("Binning", self.r_bin)
         ig.addLayout(form)
         self.lbl_axis = QtWidgets.QLabel("")
         self.lbl_axis.setStyleSheet("font-weight:bold;")
@@ -1284,14 +1295,31 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         entry = self._raw_cache.get(self._cur())
         return bool(entry[2]) if entry else False
 
+    def _recompute_bin(self) -> int:
+        return int(self.r_bin.value()) if hasattr(self, "r_bin") else 1
+
+    def _bin_raw(self, raw):
+        """Block-average each (h, w) frame of a raw interferogram cube by the
+        recompute Binning factor. 1 = full resolution (no-op)."""
+        f = self._recompute_bin()
+        raw = np.asarray(raw)
+        if f <= 1 or raw is None or raw.ndim != 3:
+            return raw
+        n, h, w = raw.shape
+        bh, bw = h // f, w // f
+        if bh == 0 or bw == 0:
+            return raw
+        return raw[:, :bh * f, :bw * f].reshape(n, bh, f, bw, f).mean(axis=(2, 4))
+
     def _phase_ref_cube(self, shape):
         """The background reference interferogram to phase-correct against, if one
-        is loaded, phasing is enabled, and its shape matches (else None)."""
+        is loaded, phasing is enabled, and its shape matches (else None). Binned
+        by the same recompute factor so it lines up with the binned measurement."""
         if not self.phase_bkg_on or self.phase_bkg is None:
             return None
-        # Crop the (full-frame) background to the SAME analysis ROI so it matches
-        # the cropped measurement raw before its phase is subtracted.
-        ref_raw = self._work_crop3(self.phase_bkg[0])
+        # Crop the (full-frame) background to the SAME analysis ROI, then bin it
+        # the same way as the measurement raw, before its phase is subtracted.
+        ref_raw = self._bin_raw(self._work_crop3(self.phase_bkg[0]))
         return ref_raw if getattr(ref_raw, "shape", None) == tuple(shape) else None
 
     def _compute_from_raw(self, zi):
@@ -1300,6 +1328,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             return None, None
         if self.proc is None:
             self.proc = HyperspectralProcessor()
+        raw = self._bin_raw(raw)   # recompute at the chosen spatial binning
         nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
         return self.proc.compute_hyperspectral(
             pos, raw, wl_start=self.r_wl0.value(), wl_stop=self.r_wl1.value(),
@@ -1988,6 +2017,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.ph_info.setText("This file has no stored raw interferogram — "
                                  "the phase view is unavailable (re-acquire with raw saved).")
             return
+        raw = self._bin_raw(raw)   # match the recompute Binning setting
         idx = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
         lam = float(np.asarray(self.wavelengths)[idx])
         if self.proc is None:
@@ -2113,7 +2143,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         dest = QtWidgets.QFileDialog.getExistingDirectory(self, "Save phased Z×θ stack to…")
         if not dest:
             return
-        ref_raw = self.phase_bkg[0]
+        ref_raw = self._bin_raw(self.phase_bkg[0])   # bin ref to the recompute factor
         if self.proc is None:
             self.proc = HyperspectralProcessor()
         wl0, wl1 = self.r_wl0.value(), self.r_wl1.value()
@@ -2134,12 +2164,16 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                         "background", "background_subtracted", "saturation_mask",
                         "twins_positions_mm", "twins_positions_calibrated_mm")
                         if key in d.files}
-                if raw is None or pos is None or ref_raw.shape != raw.shape:
+                if raw is None or pos is None:
+                    skipped += 1
+                    continue
+                raw_b = self._bin_raw(raw)     # bin for the DFT; raw saved full-res
+                if getattr(ref_raw, "shape", None) != raw_b.shape:
                     skipped += 1
                     continue
                 nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
                 wl, cube = self.proc.compute_hyperspectral(
-                    pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
+                    pos, raw_b, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
                     search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
                     reference_cube=ref_raw, center_method=cmethod)
@@ -2150,7 +2184,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 meta.update(phase_corrected=True,
                             phase_background=os.path.basename(self.phase_bkg[2]),
                             recompute_window_mm=win, recompute_apod=apod,
-                            recompute_nfreq=int(nfreq))
+                            recompute_nfreq=int(nfreq),
+                            raw_binning=1, spectrum_binning=self._recompute_bin())
                 kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
                           raw_interferogram=np.asarray(raw, np.float32),
                           metadata=np.array(meta, dtype=object),
@@ -2508,19 +2543,23 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 if pos is None or raw is None:
                     continue
                 nfreq = resolve_n_points(len(pos), manual=nfset)
+                raw_b = self._bin_raw(raw)     # recompute at the chosen binning
                 wl, cube = self.proc.compute_hyperspectral(
-                    pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
+                    pos, raw_b, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
                     search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
                     center_method=cmethod)
                 meta.update(recompute_window_mm=win, recompute_apod=apod,
                             recompute_wl_um=[wl0, wl1], recompute_nfreq=int(nfreq),
-                            recompute_center=cmethod)
+                            recompute_center=cmethod,
+                            raw_binning=1, spectrum_binning=self._recompute_bin())
                 kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
                           z_value_mm=info["z"], z_unit="mm",
                           metadata=np.array(meta, dtype=object),
                           metadata_json=json.dumps(meta, default=str, indent=2))
-                if mask is not None:
+                # Keep the saturation mask only if it still matches the (possibly
+                # binned) spectrum geometry; otherwise it no longer applies.
+                if mask is not None and getattr(mask, "shape", None) == cube.shape[1:]:
                     kw["saturation_mask"] = np.asarray(mask, bool)
                 base = os.path.splitext(os.path.basename(info["path"]))[0]
                 np.savez(os.path.join(out, base + "_rewin.npz"), **kw)  # uncompressed: fast write
