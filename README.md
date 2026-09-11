@@ -67,13 +67,19 @@ gui/
   Twins/ASRC calibration/ parameters_{cal,int}.txt  spectral + motor calibration
   analysis_app.py       standalone Z-series hyperspectral analyzer
   view_hyperspectral.py standalone cube viewer
+  main_lockin.py        lock-in acquisition app (MCS2 stage + SR865A, no camera)
+    ui/lockin_window.py lockin_panel.py mcs2_panel.py lockin_scan_panel.py
+    instruments/        mcs2_stage.py lockin_sr860.py lockin_scan.py
   docs/                 ACQUISITION_APP.md (architecture) + CONTINUUM_SUBTRACTION.md
+                        + LOCKIN_APP.md (lock-in acquisition app)
 ```
 
 See **[docs/ACQUISITION_APP.md](docs/ACQUISITION_APP.md)** for a full technical
 walk-through of the architecture, and
 **[docs/CONTINUUM_SUBTRACTION.md](docs/CONTINUUM_SUBTRACTION.md)** for the
 per-pixel continuum-subtraction method used to isolate the resonant line image.
+**[docs/LOCKIN_APP.md](docs/LOCKIN_APP.md)** covers the companion lock-in
+acquisition app, which swaps the camera for an SR865A on a SmarAct MCS2 stage.
 
 ## Setup (one time)
 
@@ -97,6 +103,8 @@ run.bat                                       REM main.py --mode irc806 --fps 12
 .venv\Scripts\python main.py --mode mock      REM no camera/hardware needed
 view.bat  path\to\cube.npz                    REM standalone cube viewer
 analyze.bat                                   REM standalone Z-series analyzer
+run_lockin.bat                                REM MCS2 stage + SR865A lock-in scan
+.venv\Scripts\python main_lockin.py --simulate  REM lock-in app, no hardware
 ```
 
 ## Hardware notes
@@ -112,3 +120,9 @@ analyze.bat                                   REM standalone Z-series analyzer
   (Z825B / PRM1-Z8) to its controller in the Kinesis app first, or moves come out
   in raw device units.
 - Camera IP is auto-discovered; no IP needs to be set.
+- The lock-in app gets the SR865A driver from `requirements.txt`
+  (`srsinst.sr860`); add `pyvisa` only for the VISA/USB transport. The stage
+  needs the **SmarAct MCS2 SDK**, which is not on PyPI: `pip install
+  C:\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip`. MCS2 sensors are
+  incremental, so **Find reference** must run once per power-up before absolute
+  positions mean anything. See [docs/LOCKIN_APP.md](docs/LOCKIN_APP.md).

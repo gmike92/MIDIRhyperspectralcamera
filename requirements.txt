@@ -11,3 +11,26 @@ pythonnet
 #  - Pleora eBUS runtime, system-wide  (Common Files\Pleora\eBUS SDK\PvDotNet.dll)
 #  - Thorlabs Kinesis                  (delay stage + rotator, KDC101)
 #  - SmarAct SCU3D driver              (TWINS wedge: SCU3DControl.dll)
+
+# --- Lock-in acquisition app (main_lockin.py): MCS2 stage + SR865A -----------
+# GUI/plotting come from PyQt6/pyqtgraph/numpy above. Instrument packages:
+srsinst.sr860       # SR865A driver (pulls in srsgui + python-vxi11)
+# pyvisa            # only for the VISA (USB/GPIB) transport -- see the warning
+#
+# WARNING about pyvisa: it is only a Python wrapper. USB does NOT work from
+# `pip install pyvisa` alone -- you also need a VISA runtime installed
+# system-wide (NI-VISA from ni.com, or Keysight IO Libraries), which is what
+# supplies both visa64.dll and the USBTMC driver Windows binds to the
+# instrument. Worse, pyvisa WITHOUT a runtime breaks `import srsinst.sr860`
+# outright: its VisaInterface builds a ResourceManager at class-body scope, so
+# the import raises "Could not locate a VISA implementation". The app survives
+# that (it falls back to talking to vxi11/pyvisa directly), but LAN is the
+# simpler route -- VXI-11 needs no runtime at all.
+#
+# `smaract.ctl` (the MCS2 stage) is NOT on PyPI -- install it from the SDK:
+#   pip install C:\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip
+# The SDK also provides SmarActCTL.dll, which that package loads.
+#
+# All three instrument links are optional at import time: every driver has a
+# simulate mode, so `python main_lockin.py --simulate` runs the whole scan path
+# with nothing installed or plugged in.
