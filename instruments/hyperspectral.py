@@ -442,8 +442,15 @@ class HyperspectralProcessor:
                             apod_width=0.2, apod_type="gaussian",
                             expected_zero_mm=None, search_mm=None,
                             ft_window_mm=None, positions_calibrated=False,
-                            reference_cube=None, center_method="envelope"):
+                            reference_cube=None, center_method="envelope",
+                            band_wl=None):
         """Per-pixel COMPLEX DFT at ONE wavelength -> (complex_map (h,w), info).
+
+        `band_wl`: optional iterable of wavelengths (µm). When given, the phase-
+        corrected complex field is computed at EACH of them and coherently
+        averaged, so the map represents a spectral BAND rather than a single line
+        (`wavelength_um` is then just the reported centre). Falls back to the
+        single-wavelength transform when None/one value.
 
         The saved spectrum cube keeps only the DFT magnitude (np.abs), throwing
         the interferometric PHASE away. This runs the SAME forward transform as
@@ -528,20 +535,31 @@ class HyperspectralProcessor:
                 box = np.broadcast_to(inwin[:, None, None].astype(float), apod.shape)
                 apod = np.where(in_c[None], apod * inwin[:, None, None], box)
 
-        # Single-frequency DFT for the requested wavelength.
-        freq = self._get_frequency_limits(wavelength_um, wavelength_um)[0]
+        # DFT over the requested wavelength (or coherently averaged over a band).
+        # Frequencies of the centre + any band members.
+        if band_wl is None or np.ndim(band_wl) == 0 or len(np.atleast_1d(band_wl)) <= 1:
+            wls = [float(wavelength_um)]
+        else:
+            wls = [float(w) for w in np.atleast_1d(band_wl)]
+        freqs = [self._get_frequency_limits(w, w)[0] for w in wls]
         dpos = np.diff(positions)
         dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0.0)
         wkernel = ((dpos * apod)[:, np.newaxis, np.newaxis] if apod.ndim == 1
                    else dpos[:, np.newaxis, np.newaxis] * apod)
-        kernel = np.exp(-2j * np.pi * positions * freq)          # (n_pos,)
-        spec_flat = np.conj(kernel) @ (sig * wkernel).reshape(n_pos, -1)  # (h*w,)
-        complex_map = spec_flat.reshape(h, w)
-        if ref_sig is not None:
-            ref_spec = np.conj(kernel) @ (ref_sig * wkernel).reshape(n_pos, -1)
-            complex_map = complex_map * np.exp(-1j * np.angle(ref_spec.reshape(h, w)))
+        sigw = (sig * wkernel).reshape(n_pos, -1)
+        refw = (ref_sig * wkernel).reshape(n_pos, -1) if ref_sig is not None else None
+        acc = np.zeros(h * w, dtype=complex)
+        for f in freqs:                                  # phase-correct EACH λ, then average
+            kernel = np.exp(-2j * np.pi * positions * f)
+            sp = np.conj(kernel) @ sigw
+            if refw is not None:
+                rp = np.conj(kernel) @ refw
+                sp = sp * np.exp(-1j * np.angle(rp))
+            acc += sp
+        complex_map = (acc / len(freqs)).reshape(h, w)
         info = {"center_mm": float(cpos_c) if scalar else float(np.median(cpos_c)),
-                "freq": float(freq), "per_pixel_center": not scalar,
+                "freq": float(freqs[len(freqs) // 2]), "per_pixel_center": not scalar,
+                "n_band": len(freqs),
                 "n_used": int(np.count_nonzero(apod.any(axis=(1, 2)) if apod.ndim == 3
                                                else apod)),
                 "phase_corrected": ref_sig is not None}

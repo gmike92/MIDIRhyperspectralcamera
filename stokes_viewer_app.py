@@ -145,12 +145,20 @@ class StokesViewerApp(StokesMapsApp):
             return
 
         maskpct = self.sp_mask.value()
+        # Spectral band: coherently average the cached complex frames over the
+        # wavelengths within ±band of the slider λ (single frame when band = 0).
+        hw = self.sp_band.value()
+        if hw > 0:
+            bidx = np.where(np.abs(self.wl - self.wl[li]) <= hw)[0]
+            frame = (lambda cube: cube[bidx].mean(axis=0)) if bidx.size >= 2 else (lambda cube: cube[li])
+        else:
+            frame = lambda cube: cube[li]
         # --- I45 reference frame at this (z, λ) ---
         self._i45_amp = None; self._i45_phase = None; self._i45_valid = None
         gmask = None
         i45cube = entry["ref"] if self.combo_i45src.currentIndex() == 0 else entry["i45"]
         if i45cube is not None:
-            Gi = i45cube[li]
+            Gi = frame(i45cube)
             self._i45_amp = np.abs(Gi).astype(np.float64)
             self._i45_phase = np.angle(Gi).astype(np.float64)
             pk = _robust_peak(self._i45_amp)
@@ -172,7 +180,7 @@ class StokesViewerApp(StokesMapsApp):
                 self.amp_img[k].clear(); self.ph_img[k].clear()
                 self.amp_title[k].setText(f"M{k+1}")
                 prepared.append(None); continue
-            Gk = G[li]
+            Gk = frame(G)
             amp = np.abs(Gk).astype(np.float64)
             phase = np.angle(Gk).astype(np.float64)
             valid = np.isfinite(amp)
@@ -192,7 +200,9 @@ class StokesViewerApp(StokesMapsApp):
         self._refresh_mask_overlay()
         self._refresh_phase()
         n_loaded = sum(p is not None for p in prepared)
-        self._status_base = (f"z = {z:.4f} mm   |   λ = {self.wl[li]:.4f} µm   |   "
+        band_txt = (f" ±{hw:.4g} µm ({int(np.sum(np.abs(self.wl-self.wl[li])<=hw))} λ)"
+                    if hw > 0 else "")
+        self._status_base = (f"z = {z:.4f} mm   |   λ = {self.wl[li]:.4f} µm{band_txt}   |   "
                              f"{n_loaded}/3 maps (precomputed)"
                              + ("   |   phasing ON" if phased else ""))
         self._compute_stokes(prepared)

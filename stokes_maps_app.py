@@ -287,6 +287,16 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         wlrow.addWidget(self.sl_wl, 1)
         self.lbl_wl = QtWidgets.QLabel("-- µm"); self.lbl_wl.setStyleSheet("font-weight:600;")
         wlrow.addWidget(self.lbl_wl)
+        wlrow.addWidget(QtWidgets.QLabel("± band"))
+        self.sp_band = QtWidgets.QDoubleSpinBox()
+        self.sp_band.setRange(0.0, 100.0); self.sp_band.setDecimals(4)
+        self.sp_band.setSuffix(" µm"); self.sp_band.setValue(0.0)
+        self.sp_band.setToolTip("Half-width of the spectral band around the slider λ. "
+                                "0 = single wavelength; otherwise the maps use every "
+                                "wavelength in [λ−band, λ+band] (phase-corrected then "
+                                "coherently averaged).")
+        self.sp_band.valueChanged.connect(self._on_lambda)
+        wlrow.addWidget(self.sp_band)
         root.addLayout(wlrow)
 
         # --- DFT controls (mirror the analysis_app Phase panel) ---
@@ -327,9 +337,10 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         ctl.addWidget(self.combo_mode)
         self.chk_sauto = QtWidgets.QCheckBox("Auto scale")
         self.chk_sauto.setChecked(True)
-        self.chk_sauto.setToolTip("Auto-scale the last-row (Stokes) colorbars "
-                                  "(normalised = −1…1). Uncheck — or just drag a "
-                                  "colorbar — to set and keep a custom stretch.")
+        self.chk_sauto.setToolTip("Auto-scale the Stokes colorbars (normalised = −1…1). "
+                                  "Drag a panel's positive edge to stretch that map "
+                                  "symmetrically (the negative edge follows); re-check "
+                                  "to restore the default.")
         self.chk_sauto.toggled.connect(self._recompute_stokes_only)
         ctl.addWidget(self.chk_sauto)
         ctl.addStretch(1)
@@ -359,7 +370,8 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         glw, self.i45_ph_img, self.i45_ph_cbar, self.i45_ph_title = self._make_panel("phase I\u2084\u2085  (scale in \u03c0)", cyc)
         self.i45_ph_cbar.setLevels((-np.pi, np.pi)); _set_pi_ticks(self.i45_ph_cbar)
         grid.addWidget(glw, 1, 0); _reg("I45_phase", "I\u2084\u2085 phase", self.i45_ph_img, glw)
-        glw, self.s0_img, self.s0_cbar, self.s0_title = self._make_panel("S\u2080 = 2\u00b7I\u2084\u2085 \u2212 S\u2082", turbo, title_size="9pt")
+        glw, self.s0_img, self.s0_cbar, self.s0_title = self._make_panel(
+            "S\u2080 = 2\u00b7I\u2084\u2085 \u2212 S\u2082", turbo, title_size="9pt")
         grid.addWidget(glw, 2, 0); _reg("S0", "S\u2080", self.s0_img, glw)
 
         # Measurement columns (1..3).
@@ -379,7 +391,7 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         for k in range(3):
             glw, img, cbar, lbl = self._make_panel(TITLES_SIGNED[k], bwr, title_size="9pt",
                                                    interactive=True)   # draggable levels
-            cbar.sigLevelsChanged.connect(self._on_stokes_levels)
+            cbar.sigLevelsChanged.connect(lambda _c=None, kk=k: self._on_stokes_levels(kk))
             self.s_img.append(img); self.s_cbar.append(cbar); self.s_title.append(lbl)
             grid.addWidget(glw, 2, k + 1); _reg(f"S{k+1}", f"S{k+1}", img, glw)
         for r in range(3):
@@ -573,6 +585,17 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         i = int(np.clip(self.sl_wl.value(), 0, len(self.wl) - 1))
         return float(self.wl[i])
 
+    def _band_wls(self, lam):
+        """Wavelengths within ±band of `lam` (or None for a single wavelength)."""
+        if self.wl is None or lam is None:
+            return None
+        hw = self.sp_band.value()
+        if hw <= 0:
+            return None
+        band = np.asarray(self.wl, float)
+        band = band[(band >= lam - hw) & (band <= lam + hw)]
+        return band if band.size >= 2 else None
+
     def _i45_source(self):
         """The cube whose |field| is I45: the phasing ref or the separate cube."""
         return self.ref if self.combo_i45src.currentIndex() == 0 else self.i45
@@ -589,6 +612,7 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                   else "envelope")
         ftwin = ((self.sp_ft0.value(), self.sp_ft1.value())
                  if self.chk_ftwin.isChecked() else None)
+        band_wl = self._band_wls(lam)                    # None -> single wavelength
         # phasing reference measurement at this z (folder resolved).
         ref_meas = self._resolve(self.ref, z)
         phasing = self.chk_phase.isChecked() and ref_meas is not None
@@ -600,7 +624,7 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                 meas["pos"], meas["raw"], lam, apod_type=apod, ft_window_mm=ftwin,
                 expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                 positions_calibrated=meas["cal"], reference_cube=ref_raw,
-                center_method=center)
+                center_method=center, band_wl=band_wl)
             return c
 
         # --- I45 reference: its |field| is the mask source and S0 uses it. ---
@@ -677,7 +701,9 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         self._refresh_mask_overlay()
         self._refresh_phase()          # row 2 (optionally amplitude-weighted)
         n_loaded = sum(p is not None for p in prepared)
-        base = (f"z = {z:.4f} mm   |   λ = {lam:.4f} µm   |   apod {apod}   |   "
+        band_txt = (f" ±{self.sp_band.value():.4g} µm ({len(band_wl)} λ)"
+                    if band_wl is not None else "")
+        base = (f"z = {z:.4f} mm   |   λ = {lam:.4f} µm{band_txt}   |   apod {apod}   |   "
                 f"centre {center}   |   {n_loaded}/3 maps"
                 + ("   |   phasing ON" if phasing else ""))
         if notes:
@@ -801,11 +827,10 @@ class StokesMapsApp(QtWidgets.QMainWindow):
 
         # (v) S0 = 2*I45 - S2 (signed), then P = |s|/S0. Both need signs + I45.
         s0 = (2.0 * i45 - s_signed[1]) if (have_i45 and s_signed is not None) else None
+        s0_disp = None
         if s0 is not None:
             s0_disp = np.where(combined, s0, np.nan)
-            self.s0_img.setImage(s0_disp, autoLevels=False)
-            hi0 = _nanmax_safe(s0_disp, default=1.0)
-            self.s0_cbar.setLevels((0.0, hi0 if hi0 > 0 else 1.0))
+            self.s0_img.setImage(s0_disp, autoLevels=False)   # levels set below
             self.s0_title.setText("S₀ = 2·I₄₅ − S₂", size="9pt")
         else:
             self.s0_img.clear()
@@ -837,9 +862,11 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             titles = TITLES_UNSIGNED
             cmap = pg.colormap.get("turbo")
 
-        # Auto-scale sets the mode default each refresh; when off, the user's
-        # dragged/custom colorbar levels are preserved. Block the level signal so
-        # our own setLevels don't read as a user drag.
+        # Auto sets the mode default each refresh (S1..S3 symmetric about 0 /
+        # 0..max for unsigned; S0 always 0..max). When auto is off, each S1..S3
+        # colorbar keeps whatever symmetric stretch the user dragged. S0 always
+        # auto-scales (0..max). Block the level signal so our setLevels aren't
+        # read as user drags.
         auto = self.chk_sauto.isChecked()
         self._setting_levels = True
         try:
@@ -848,31 +875,45 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                 self.s_cbar[k].setColorMap(cmap)
                 img = np.where(combined, vals[k], np.nan)
                 self.s_img[k].setImage(img, autoLevels=False)
-                if not auto:
-                    continue                          # keep the user's stretch
-                if normalize:                         # S_i/S0 is bounded to [-1, 1]
-                    self.s_cbar[k].setLevels((-1.0, 1.0))
-                elif signed:                          # diverging, symmetric about 0
-                    m = _nanmax_safe(np.abs(img), default=1.0)
-                    self.s_cbar[k].setLevels((-m if m > 0 else -1.0, m if m > 0 else 1.0))
-                else:
-                    hi = _nanmax_safe(img, default=1.0)
-                    self.s_cbar[k].setLevels((0.0, hi if hi > 0 else 1.0))
+                if auto:
+                    if normalize:                     # S_i/S0 bounded to [-1, 1]
+                        self.s_cbar[k].setLevels((-1.0, 1.0))
+                    elif signed:                      # symmetric about 0
+                        m = _nanmax_safe(np.abs(img), default=1.0)
+                        self.s_cbar[k].setLevels((-m if m > 0 else -1.0, m if m > 0 else 1.0))
+                    else:                             # unsigned magnitudes: 0..max
+                        hi = _nanmax_safe(img, default=1.0)
+                        self.s_cbar[k].setLevels((0.0, hi if hi > 0 else 1.0))
+                    # fine, scale-aware step so dragging on [-1,1] isn't snapped to
+                    # integers (ColorBarItem's default rounding=1).
+                    _, _hh = self.s_cbar[k].levels()
+                    self.s_cbar[k].rounding = max(abs(_hh), 1e-6) / 500.0
+            if s0_disp is not None:                   # S0 is always 0..max
+                hi0 = _nanmax_safe(s0_disp, default=1.0)
+                self.s0_cbar.setLevels((0.0, hi0 if hi0 > 0 else 1.0))
         finally:
             self._setting_levels = False
         self._status(f"   |   Stokes over {n_ok} px" + note
                      + ("" if auto else "   |   custom Stokes scale"))
 
-    def _on_stokes_levels(self, *a):
-        """A user drag of a Stokes colorbar switches off auto-scaling so the
-        custom stretch persists across slider moves."""
+    def _on_stokes_levels(self, k):
+        """Dragging ONE S1..S3 colorbar: keep it symmetric about 0 from the
+        positive edge (the negative edge follows), live and independent per panel."""
         if self._setting_levels:
             return
-        if self.chk_sauto.isChecked():
+        cb = self.s_cbar[k]
+        lo, hi = cb.levels()
+        v = hi if hi > 0 else abs(lo)                 # positive cursor drives it
+        if not (v > 0):
+            v = cb.rounding or 1e-6
+        if self.chk_sauto.isChecked():                # a manual stretch -> leave auto
             self.chk_sauto.blockSignals(True); self.chk_sauto.setChecked(False)
             self.chk_sauto.blockSignals(False)
-            self._status(self.status.text().split("   |   Stokes")[0]
-                         + "   |   custom Stokes scale")
+        self._setting_levels = True
+        try:
+            cb.setLevels((-v, v))                     # this panel only, symmetric
+        finally:
+            self._setting_levels = False
 
     # --------------------------------------------------------------- export
     def _open_export_dialog(self):
@@ -898,7 +939,8 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         fmt_row.addWidget(QtWidgets.QLabel("Format:"))
         combo = QtWidgets.QComboBox()
         combo.addItems(["PNG image (rendered figure)", "TIFF (float data)",
-                        "NumPy .npy (data)", "CSV (data)", "NPZ bundle (all-in-one)"])
+                        "NumPy .npy (data)", "CSV (data)", "NPZ bundle (all-in-one)",
+                        "MAT bundle (MATLAB)"])
         fmt_row.addWidget(combo, 1); v.addLayout(fmt_row)
         bb = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -913,16 +955,23 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         self._do_export(selected, combo.currentIndex())
 
     def _do_export(self, selected, fmt):
-        # fmt: 0 PNG (rendered), 1 TIFF float, 2 npy, 3 csv, 4 npz bundle.
-        if fmt == 4:                                     # single .npz bundle
+        # fmt: 0 PNG, 1 TIFF float, 2 npy, 3 csv, 4 npz bundle, 5 MAT (MATLAB).
+        if fmt in (4, 5):                                # single-file bundle
+            mat = fmt == 5
+            default = "stokes_maps.mat" if mat else "stokes_maps.npz"
+            filt = "MATLAB (*.mat)" if mat else "NumPy archive (*.npz)"
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save NPZ bundle", os.path.join(self._last_dir, "stokes_maps.npz"),
-                "NumPy archive (*.npz)")
+                self, "Save bundle", os.path.join(self._last_dir, default), filt)
             if not path:
                 return
+            # Keys are valid MATLAB variable names (S1, S0, M1_amplitude, …).
             data = {p["key"]: np.asarray(p["img"].image) for p in selected}
             try:
-                np.savez(path, **data)
+                if mat:
+                    from scipy.io import savemat
+                    savemat(path, data)                  # -> load('file.mat') in MATLAB
+                else:
+                    np.savez(path, **data)
             except Exception as e:  # noqa: BLE001
                 QtWidgets.QMessageBox.critical(self, "Export failed", str(e)); return
             self.status.setText(f"Exported {len(data)} maps → {os.path.basename(path)}")
