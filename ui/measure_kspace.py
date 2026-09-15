@@ -1129,10 +1129,15 @@ class MeasurePanel(QWidget):
             wl0, wl1 = self.spin_wl0.value(), self.spin_wl1.value()
             wl_center = 0.5 * (wl0 + wl1)
             apod_type = self.combo_apod.currentText()
-            res_nm = self.est_proc.estimate_resolution_nm(
+            res, unit = self.est_proc.estimate_resolution_nm(
                 abs(stop - start), wl_center, apod_type=apod_type)
-            self.lbl_resolution.setText(
-                "-- nm" if res_nm is None else f"~{res_nm:.0f} nm @ {wl_center:.1f} µm")
+            if res is None:
+                self.lbl_resolution.setText("--")
+            elif unit == "nm":
+                self.lbl_resolution.setText(f"~{res:.0f} nm @ {wl_center:.1f} µm")
+            else:
+                # No calibration loaded: reciprocal units, no nm conversion.
+                self.lbl_resolution.setText(f"~{res:.3g} {unit} (no calibration)")
 
             wl_short = min(wl0, wl1)
             max_um = self.est_proc.max_step_um(wl_short, samples_per_cycle=5)
