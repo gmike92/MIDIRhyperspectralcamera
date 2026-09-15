@@ -60,8 +60,7 @@ def recover_file(path, dest_dir, proc):
     # --- scan parameters (from the file's own metadata) ---
     wl0 = _f(meta.get("wl_start_um"), 3.8)
     wl1 = _f(meta.get("wl_stop_um"), 4.4)
-    apod_width = _f(meta.get("apod_width"), 0.2)
-    apod_type = str(meta.get("apodization", "gaussian"))
+    apod_type = str(meta.get("apodization", "happ-genzel"))
     ft_region = str(meta.get("ft_region", "full"))
     ft_width = _f(meta.get("ft_width_mm"), 0.1)
     walkoff = meta.get("walkoff", None)
@@ -98,7 +97,7 @@ def recover_file(path, dest_dir, proc):
     # --- the per-pixel DFT (motor calibration applied inside, positions raw) ---
     wl, cube = proc.compute_hyperspectral(
         positions, dcb, wl_start=wl0, wl_stop=wl1,
-        apod_width=apod_width, n_freq=n_freq,
+        n_freq=n_freq,
         expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
         apod_type=apod_type, walkoff=walkoff,
         ft_region=ft_region, ft_width_mm=ft_width)

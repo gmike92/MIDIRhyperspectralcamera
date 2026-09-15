@@ -18,8 +18,8 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
-    QDoubleSpinBox, QGroupBox, QGridLayout, QHBoxLayout, QLabel, QProgressBar,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QGroupBox, QGridLayout, QHBoxLayout, QLabel,
+    QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from instruments.subtwinslv import TwinsScanner
@@ -27,6 +27,7 @@ from instruments.spectrum_processor import (
     DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS, DEFAULT_APODIZATION,
     DEFAULT_WL_START, DEFAULT_WL_STOP,
 )
+from instruments.dsp import APOD_TYPES
 
 
 class TwinsScanPanel(QWidget):
@@ -72,7 +73,6 @@ class TwinsScanPanel(QWidget):
             "ts_stop": (self.spin_stop, float),
             "ts_steps": (self.spin_steps, int),
             "ts_frames": (self.spin_frames, int),
-            "ts_apod": (self.spin_apod, float),
             "ts_wl0": (self.spin_wl0, float),
             "ts_wl1": (self.spin_wl1, float),
             "ts_npoints": (self.spin_npoints, int),
@@ -164,12 +164,12 @@ class TwinsScanPanel(QWidget):
         g = QGroupBox("Spectrum (DFT)")
         grid = QGridLayout(g)
 
-        self.spin_apod = QDoubleSpinBox()
-        self.spin_apod.setRange(0.01, 5.0)
-        self.spin_apod.setSingleStep(0.05)
-        self.spin_apod.setValue(DEFAULT_APODIZATION)
+        # Symmetric apodization window (centred at the ZPD, no width parameter).
+        self.combo_apod = QComboBox()
+        self.combo_apod.addItems(APOD_TYPES)
+        self.combo_apod.setCurrentText("happ-genzel")
         grid.addWidget(QLabel("Apodization"), 0, 0)
-        grid.addWidget(self.spin_apod, 0, 1)
+        grid.addWidget(self.combo_apod, 0, 1)
 
         self.spin_wl0 = QDoubleSpinBox()
         self.spin_wl0.setRange(0.1, 100.0)
@@ -312,7 +312,7 @@ class TwinsScanPanel(QWidget):
         try:
             wl, spec = self.scanner.compute_spectrum(
                 wl_start=self.spin_wl0.value(), wl_stop=self.spin_wl1.value(),
-                apod_width=self.spin_apod.value(), n_points=self.spin_npoints.value())
+                apod_type=self.combo_apod.currentText(), n_points=self.spin_npoints.value())
         except Exception as e:  # noqa: BLE001
             self.sig_status.emit(f"spectrum error: {e}")
             return

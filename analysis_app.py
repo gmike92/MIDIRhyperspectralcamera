@@ -704,8 +704,9 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ig.addLayout(pb)
         form = QtWidgets.QFormLayout()
         self.r_apod = QtWidgets.QComboBox()
-        self.r_apod.addItems(["gaussian", "happ-genzel", "blackman-harris-3",
-                              "blackman-harris-4", "boxcar"])
+        # SYMMETRIC FTIR windows centred at the ZPD (no width parameter).
+        self.r_apod.addItems(["happ-genzel", "blackman-harris-3",
+                              "blackman-harris-4", "triangular", "boxcar"])
         # How the apodization ZPD centre is found: one field-wide centre-burst
         # (envelope of the signed spatial sum), or an independent I^2 barycentre
         # per pixel (follows a ZPD that drifts across the field of view).
