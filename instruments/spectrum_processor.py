@@ -232,7 +232,7 @@ class SpectrumProcessor:
         """Nyquist (2 samples/cycle) stage step at the shortest wavelength."""
         return self.max_step_um(wl_short_um, samples_per_cycle=2)
 
-    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="gaussian"):
+    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
         """Spectral resolution (FWHM, nm) from the stage scan range, using the
         calibration's local slope d(reciprocal)/d(1/λ) so TWINS birefringence +
         wedge geometry are accounted for. Δk = 1/L for the legacy gaussian, or the
@@ -267,8 +267,8 @@ class SpectrumProcessor:
             return None
 
     def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         apod_width=0.2, n_points=10000, invert=False, symmetrize=False,
-                         expected_zero_mm=None, search_mm=None, apod_type="gaussian"):
+                         apod_width=None, n_points=10000, invert=False, symmetrize=False,
+                         expected_zero_mm=None, search_mm=None, apod_type="happ-genzel"):
         """Compute spectrum from interferogram using DFT."""
         if self.interferogram is None or self.positions is None:
             return None, None
@@ -320,12 +320,10 @@ class SpectrumProcessor:
             self.center_idx = center_idx
 
         self.symmetrized_signal = signal
-        if str(apod_type).lower() == "gaussian":
-            apodized = self.apodization(signal, c_positions, apod_width, center_idx=center_idx)
-        else:
-            from instruments.dsp import apodization_window
-            window = apodization_window(apod_type, len(signal), center_idx)
-            apodized = signal * window
+        # SYMMETRIC apodization window centred at the ZPD (no width param).
+        from instruments.dsp import apodization_window
+        window = apodization_window(apod_type, len(signal), center_idx)
+        apodized = signal * window
 
         start_freq, end_freq = self._get_frequency_limits(wl_start, wl_stop)
         frequencies = np.linspace(end_freq, start_freq, n_points)

@@ -180,7 +180,7 @@ class HyperspectralProcessor:
         """Nyquist (2 samples/cycle) stage step at the shortest wavelength."""
         return self.max_step_um(wl_short_um, samples_per_cycle=2)
 
-    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="gaussian"):
+    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
         """Spectral resolution (FWHM, nm) from the stage scan range, using the
         calibration's local slope (accounts for TWINS birefringence). The stage
         pseudo-frequency FWHM is 1/L for the legacy gaussian, or the apodization-
@@ -216,9 +216,9 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               apod_width=0.2, n_freq=200, reference_cube=None, invert=False,
+                               apod_width=None, n_freq=200, reference_cube=None, invert=False,
                                expected_zero_mm=None, search_mm=None,
-                               apod_type="gaussian", walkoff=None,
+                               apod_type="happ-genzel", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
                                positions_calibrated=False, center_method="envelope"):
         """
@@ -343,17 +343,8 @@ class HyperspectralProcessor:
             except Exception:
                 pass
 
-            if str(apod_type).lower() == "gaussian":
-                sigma = abs(c_pos[-1] - c_pos[0]) * apod_width
-                if sigma > 0:
-                    if scalar:
-                        apod = np.exp(-(c_pos - cpos_c)**2 / (2.0 * sigma**2))
-                    else:
-                        apod = np.exp(-(c_pos[:, None, None] - cpos_c[None])**2
-                                      / (2.0 * sigma**2))
-                else:
-                    apod = np.ones(len(c_pos))
-            elif scalar:
+            # SYMMETRIC apodization window centred at the ZPD (no width param).
+            if scalar:
                 from instruments.dsp import apodization_window
                 apod = apodization_window(apod_type, len(c_pos), center)
             else:
@@ -429,7 +420,7 @@ class HyperspectralProcessor:
         return wavelengths, spectrum_cube.astype(np.float32)
 
     def compute_complex_map(self, positions, datacube, wavelength_um,
-                            apod_width=0.2, apod_type="gaussian",
+                            apod_width=None, apod_type="happ-genzel",
                             expected_zero_mm=None, search_mm=None,
                             ft_window_mm=None, positions_calibrated=False,
                             reference_cube=None, center_method="envelope"):
@@ -489,17 +480,8 @@ class HyperspectralProcessor:
         scalar = np.ndim(center) == 0
         cpos_c = positions[center]                         # scalar or (h, w)
 
-        # Apodization (gaussian in position space, or a named FTIR window).
-        if str(apod_type).lower() == "gaussian":
-            sigma = abs(positions[-1] - positions[0]) * apod_width
-            if sigma <= 0:
-                apod = np.ones(len(positions))
-            elif scalar:
-                apod = np.exp(-(positions - cpos_c) ** 2 / (2.0 * sigma ** 2))
-            else:
-                apod = np.exp(-(positions[:, None, None] - cpos_c[None]) ** 2
-                              / (2.0 * sigma ** 2))
-        elif scalar:
+        # SYMMETRIC apodization window centred at the ZPD (no width param).
+        if scalar:
             from instruments.dsp import apodization_window
             apod = apodization_window(apod_type, len(positions), center)
         else:

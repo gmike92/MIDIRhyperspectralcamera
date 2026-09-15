@@ -34,6 +34,20 @@ def _f(v, default=None):
         return default
 
 
+def _bin_cube(cube, factor):
+    """Block-average each (h, w) frame of a raw cube by `factor` (1 = no-op).
+    Binning is applied ONLY to compute the spectrum; the saved raw stays full-res."""
+    cube = np.asarray(cube)
+    f = int(factor)
+    if f <= 1 or cube.ndim != 3:
+        return cube
+    n, h, w = cube.shape
+    bh, bw = h // f, w // f
+    if bh == 0 or bw == 0:
+        return cube
+    return cube[:, :bh * f, :bw * f].reshape(n, bh, f, bw, f).mean(axis=(2, 4))
+
+
 def recover_file(path, dest_dir, proc):
     with np.load(path, allow_pickle=True) as d:
         files = set(d.files)
@@ -48,7 +62,7 @@ def recover_file(path, dest_dir, proc):
         if "raw_interferogram" not in files:
             return "skipped (no raw interferogram)"
 
-        datacube = np.asarray(d["raw_interferogram"], dtype=float)      # (n_pos, h, w), ROI-binned
+        datacube = np.asarray(d["raw_interferogram"], dtype=float)      # (n_pos, h, w) full-res raw
         positions = np.asarray(d["twins_positions_mm"], dtype=float)    # raw measured wedge axis
         cal_positions = (np.asarray(d["twins_positions_calibrated_mm"])
                          if "twins_positions_calibrated_mm" in files else None)
@@ -60,26 +74,36 @@ def recover_file(path, dest_dir, proc):
     # --- scan parameters (from the file's own metadata) ---
     wl0 = _f(meta.get("wl_start_um"), 3.8)
     wl1 = _f(meta.get("wl_stop_um"), 4.4)
-    apod_width = _f(meta.get("apod_width"), 0.2)
-    apod_type = str(meta.get("apodization", "gaussian"))
+    apod_type = str(meta.get("apodization", "happ-genzel"))
     ft_region = str(meta.get("ft_region", "full"))
     ft_width = _f(meta.get("ft_width_mm"), 0.1)
     walkoff = meta.get("walkoff", None)
     nfreq_set = int(meta.get("n_freq_setting", 0) or 0)
     n_freq = resolve_n_points(len(positions), manual=nfreq_set)
 
-    # --- saturation mask, EXACTLY as the acquisition phase 2 does ---
+    # Binning is applied ONLY to compute the spectrum; the raw stays full-res.
+    # New files carry raw_binning=1 (raw is full-res -> bin here by spectrum_binning);
+    # legacy files have no raw_binning and their raw is ALREADY binned -> don't re-bin.
+    if int(meta.get("raw_binning", 0) or 0) == 1:
+        binf = int(meta.get("spectrum_binning", meta.get("binning", 1)) or 1)
+    else:
+        binf = 1
+    dcb = _bin_cube(datacube, binf)
+    bg_binned = (_bin_cube(np.asarray(background, dtype=float)[None], binf)[0]
+                 if background is not None else None)
+
+    # --- saturation mask (on the binned spectrum geometry) ---
     sat_mask = None
     if meta.get("saturation_masking"):
-        sat_src = datacube
-        if bg_sub and background is not None:
-            sat_src = datacube + np.asarray(background, dtype=float)[None, :, :]
+        sat_src = dcb
+        if bg_sub and bg_binned is not None:
+            sat_src = dcb + bg_binned[None, :, :]
         sat_mask = saturation_mask(sat_src, meta.get("saturation_level", 16383))
 
     # --- the per-pixel DFT (motor calibration applied inside, positions raw) ---
     wl, cube = proc.compute_hyperspectral(
-        positions, datacube, wl_start=wl0, wl_stop=wl1,
-        apod_width=apod_width, n_freq=n_freq,
+        positions, dcb, wl_start=wl0, wl_stop=wl1,
+        n_freq=n_freq,
         expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
         apod_type=apod_type, walkoff=walkoff,
         ft_region=ft_region, ft_width_mm=ft_width)
@@ -93,6 +117,7 @@ def recover_file(path, dest_dir, proc):
     meta.update(processing_stage="complete",
                 cube_shape=list(np.asarray(cube).shape), n_freq=int(cube.shape[0]),
                 wl_min_um=float(np.min(wl)), wl_max_um=float(np.max(wl)),
+                raw_binning=1, spectrum_binning=int(binf),
                 recovered_from_raw=True,
                 recovered_local_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     kw = dict(

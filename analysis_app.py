@@ -704,8 +704,9 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ig.addLayout(pb)
         form = QtWidgets.QFormLayout()
         self.r_apod = QtWidgets.QComboBox()
-        self.r_apod.addItems(["gaussian", "happ-genzel", "blackman-harris-3",
-                              "blackman-harris-4", "boxcar"])
+        # SYMMETRIC FTIR windows centred at the ZPD (no width parameter).
+        self.r_apod.addItems(["happ-genzel", "blackman-harris-3",
+                              "blackman-harris-4", "triangular", "boxcar"])
         self.r_wl0 = QtWidgets.QDoubleSpinBox(); self.r_wl0.setRange(0.1, 100); self.r_wl0.setSuffix(" µm")
         self.r_wl1 = QtWidgets.QDoubleSpinBox(); self.r_wl1.setRange(0.1, 100); self.r_wl1.setSuffix(" µm")
         self.r_nfreq = QtWidgets.QSpinBox(); self.r_nfreq.setRange(0, 8192)

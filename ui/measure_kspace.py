@@ -633,17 +633,14 @@ class MeasurePanel(QWidget):
     def _build_spectrum_group(self) -> QGroupBox:
         g = QGroupBox("Spectrum (per-pixel DFT)")
         grid = QGridLayout(g)
-        # Apodization window: 'gaussian' is the NIREOS position-space window
-        # (uses Gauss width below); the rest are standard FTIR windows.
+        # Apodization window: SYMMETRIC FTIR windows centred at the ZPD, defined
+        # by size + centre only (no width parameter, no per-wing tail scaling).
         self.combo_apod = QComboBox(); self.combo_apod.addItems(APOD_TYPES)
-        self.combo_apod.setCurrentText("gaussian")
-        self.combo_apod.setToolTip("Apodization window. Affects the spectral "
-                                   "lineshape and the resolution estimate below.")
+        self.combo_apod.setCurrentText("happ-genzel")
+        self.combo_apod.setToolTip("Apodization window (symmetric, centred at the "
+                                   "ZPD). Affects the spectral lineshape and the "
+                                   "resolution estimate below.")
         self.combo_apod.currentTextChanged.connect(self._update_step)
-        self.spin_apod = QDoubleSpinBox(); self.spin_apod.setRange(0.01, 5.0)
-        self.spin_apod.setSingleStep(0.05); self.spin_apod.setValue(DEFAULT_APODIZATION)
-        self.spin_apod.setToolTip("Gaussian apodization width (only for the "
-                                  "'gaussian' window type).")
         # MWIR band for this InSb camera (repo defaults are LWIR 8-14 µm).
         # Overridden by the last-used value once a measurement has been run.
         self.spin_wl0 = self._um_spin(3.8)
@@ -663,7 +660,6 @@ class MeasurePanel(QWidget):
         self.lbl_nfreq_auto = QLabel("")
         self.lbl_nfreq_auto.setStyleSheet("color:#888; font-size:11px;")
         grid.addWidget(QLabel("Apod type"), 0, 0); grid.addWidget(self.combo_apod, 0, 1)
-        grid.addWidget(QLabel("Gauss width"), 1, 0); grid.addWidget(self.spin_apod, 1, 1)
         grid.addWidget(QLabel("λ start"), 2, 0); grid.addWidget(self.spin_wl0, 2, 1)
         grid.addWidget(QLabel("λ stop"), 3, 0); grid.addWidget(self.spin_wl1, 3, 1)
         grid.addWidget(QLabel("N freq"), 4, 0); grid.addWidget(self.spin_nfreq, 4, 1)
@@ -1013,7 +1009,6 @@ class MeasurePanel(QWidget):
             "ks_steps": (self.spin_steps, int),
             "ks_frames": (self.spin_frames, int),
             "ks_bin": (self.spin_bin, int),
-            "ks_apod": (self.spin_apod, float),
             "ks_wl0": (self.spin_wl0, float),
             "ks_wl1": (self.spin_wl1, float),
             "ks_nfreq": (self.spin_nfreq, int),
@@ -1201,7 +1196,7 @@ class MeasurePanel(QWidget):
             start=self.spin_start.value(), stop=self.spin_stop.value(),
             n=self.spin_steps.value(), frames=self.spin_frames.value(), roi=roi,
             bin=self.spin_bin.value(),
-            apod=self.spin_apod.value(), apod_type=self.combo_apod.currentText(),
+            apod_type=self.combo_apod.currentText(),
             wl0=self.spin_wl0.value(),
             wl1=self.spin_wl1.value(), nfreq=self.spin_nfreq.value(),
             walkoff=walkoff,
@@ -1221,7 +1216,7 @@ class MeasurePanel(QWidget):
             start_mm=params["start"], stop_mm=params["stop"], n_steps=nsteps,
             step_um=step_um, frames_per_point=params["frames"], binning=params["bin"],
             roi=list(roi) if roi is not None else None,
-            apodization=params["apod_type"], apod_width=params["apod"],
+            apodization=params["apod_type"],
             wl_start_um=params["wl0"], wl_stop_um=params["wl1"],
             n_freq_setting=params["nfreq"], expected_zpd_mm=DEFAULT_ZPD_MM,
             walkoff=walkoff, background_subtracted=params["bg_subtract"],
@@ -1337,7 +1332,7 @@ class MeasurePanel(QWidget):
             return
         p = dict(
             wl0=self.spin_wl0.value(), wl1=self.spin_wl1.value(),
-            nfreq=self.spin_nfreq.value(), apod=self.spin_apod.value(),
+            nfreq=self.spin_nfreq.value(),
             apod_type=self.combo_apod.currentText(),
             walkoff=(dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
                      if self.chk_walkoff.isChecked() else None),
@@ -1349,7 +1344,7 @@ class MeasurePanel(QWidget):
         # Keep the saved metadata in step with what was recomputed.
         self._scan_meta.update(
             ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
-            apodization=p["apod_type"], apod_width=p["apod"],
+            apodization=p["apod_type"],
             wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
             apod_center=p["center_method"],
             svd_denoise=p["svd_on"], svd_k=p["svd_k"], recomputed=True)
@@ -1375,7 +1370,7 @@ class MeasurePanel(QWidget):
                 n_freq = resolve_n_points(len(positions), manual=p["nfreq"])
                 wl, cube = proc.compute_hyperspectral(
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
-                    apod_width=p["apod"], n_freq=n_freq,
+                    n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],
                     ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
@@ -1645,7 +1640,7 @@ class MeasurePanel(QWidget):
                     f"FFT {k+1}/{n_acq}: per-pixel DFT ({n_freq} bins)...")
                 wl, cube = proc.compute_hyperspectral(
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
-                    apod_width=p["apod"], n_freq=n_freq,
+                    n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],
                     ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
