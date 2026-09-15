@@ -181,14 +181,21 @@ class HyperspectralProcessor:
         return self.max_step_um(wl_short_um, samples_per_cycle=2)
 
     def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
-        """Spectral resolution (FWHM, nm) from the stage scan range, using the
-        calibration's local slope (accounts for TWINS birefringence). The stage
-        pseudo-frequency FWHM is 1/L for the legacy gaussian, or the apodization-
-        broadened FWHM (FFT of the window) for a named FTIR window."""
+        """Spectral resolution from the stage scan range. Returns ``(value, unit)``:
+
+        * ``(nm, "nm")`` when a wavelength calibration is loaded -- the stage
+          reciprocal FWHM is mapped to nm through the calibration's local slope
+          (accounts for TWINS birefringence).
+        * ``(reciprocal FWHM, "1/mm")`` when NO calibration is loaded -- without
+          the cal we cannot convert stage cycles/mm to nm, so the resolution is
+          left in its native reciprocal units rather than faked.
+        * ``(None, None)`` if the inputs are invalid.
+
+        The reciprocal FWHM is 1/L for the legacy gaussian, or the apodization-
+        broadened FWHM (FFT of the window) for a named FTIR window.
+        """
         if not scan_range_mm or scan_range_mm <= 0:
-            return None
-        if not wl_center_um or wl_center_um <= 0:
-            return None
+            return None, None
         delta_recip = 1.0 / scan_range_mm
         if apod_type and str(apod_type).lower() != "gaussian":
             try:
@@ -198,8 +205,11 @@ class HyperspectralProcessor:
                     delta_recip = fwhm
             except Exception:  # noqa: BLE001
                 pass
+        # No calibration -> leave the resolution in reciprocal units (cycles/mm).
         if self.wavelength_cal is None or self.reciprocal_cal is None:
-            return (wl_center_um ** 2) * delta_recip * 1000.0
+            return delta_recip, "1/mm"
+        if not wl_center_um or wl_center_um <= 0:
+            return None, None
         try:
             from scipy.interpolate import interp1d
             fn = interp1d(1.0 / self.wavelength_cal, self.reciprocal_cal,
@@ -208,11 +218,11 @@ class HyperspectralProcessor:
             eps = max(inv_lambda_c * 1e-3, 1e-6)
             slope = float((fn(inv_lambda_c + eps) - fn(inv_lambda_c - eps)) / (2 * eps))
             if slope == 0:
-                return None
+                return None, None
             delta_inv_lambda = abs(delta_recip / slope)
-            return (wl_center_um ** 2) * delta_inv_lambda * 1000.0
+            return (wl_center_um ** 2) * delta_inv_lambda * 1000.0, "nm"
         except Exception:  # noqa: BLE001
-            return None
+            return None, None
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
