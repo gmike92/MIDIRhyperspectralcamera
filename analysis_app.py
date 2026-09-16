@@ -417,6 +417,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         save_menu.addAction("Export ROI vs Z…").triggered.connect(self.export_roi_vs_z)
         save_menu.addSeparator()
         save_menu.addAction("Recompute → save all Z…").triggered.connect(self.batch_recompute)
+        save_menu.addAction("Export processed cubes…").triggered.connect(self.export_processed_cubes)
         save_btn.setMenu(save_menu)
         tb.addWidget(save_btn)
 
@@ -621,6 +622,22 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         pr.addRow(self.chk_ratio)
         pr.addRow(b_ratio)
         pr.addRow(self.lbl_ratio)
+
+        # --- Flat-field: divide EVERY band of the current cube by that cube's own
+        #     frame at a chosen λ (Stokes-panel style). Corrects spatial
+        #     illumination; the reference frame is taken from whichever cube is
+        #     shown, so it re-derives itself for each Z/angle as you scrub.
+        self.chk_flat = QtWidgets.QCheckBox("Flat-field: ÷ frame at λ")
+        self.chk_flat.setToolTip("Divide every wavelength of the shown cube by that "
+                                 "same cube's frame at the λ below (per pixel). "
+                                 "Re-applied to each Z/angle file automatically.")
+        self.chk_flat.toggled.connect(self._on_flat_toggled)
+        self.spin_flat_wl = QtWidgets.QDoubleSpinBox()
+        self.spin_flat_wl.setRange(0.1, 100.0); self.spin_flat_wl.setDecimals(4)
+        self.spin_flat_wl.setSuffix(" µm")
+        self.spin_flat_wl.valueChanged.connect(self._on_flat_toggled)
+        pr.addRow(self.chk_flat)
+        pr.addRow("Flat-field λ", self.spin_flat_wl)
 
         self.spin_clusters = QtWidgets.QSpinBox(); self.spin_clusters.setRange(2, 16)
         self.spin_clusters.setValue(4)
@@ -951,6 +968,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             nf = len(self.wavelengths)
             self.spin_crop0.setValue(float(self.wavelengths.min()))
             self.spin_crop1.setValue(float(self.wavelengths.max()))
+            # Flat-field reference λ default = longest wavelength (blackbody frame),
+            # matching the Stokes panel's default.
+            self.spin_flat_wl.blockSignals(True)
+            self.spin_flat_wl.setValue(float(self.wavelengths.max()))
+            self.spin_flat_wl.blockSignals(False)
             self.wl_slider.blockSignals(True)
             self.wl_slider.setMinimum(0)
             self.wl_slider.setMaximum(max(0, nf - 1)); self.wl_slider.setValue(nf // 2)
@@ -1200,8 +1222,34 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         if wl is not None:
             self.wavelengths = wl
             self._sync_wl_slider(len(wl))
-        # sample / reference division first, then background subtraction on top.
-        return self._apply_background(self._apply_ratio(cube))
+        # flat-field (÷ own frame) first, then reference division, then bkg subtraction.
+        return self._apply_background(self._apply_ratio(self._apply_flatfield(cube)))
+
+    def _apply_flatfield(self, cube):
+        """Divide every band by the UNITARY flat = the cube's own frame at the
+        flat-field λ normalised to its peak, frame/max(frame). This corrects the
+        spatial illumination shape while preserving the absolute intensity scale
+        (÷ by a 0..1 map, peak = 1). Near-zero flat pixels -> NaN. The flat is
+        taken from the CURRENT cube, so each Z/angle file is flat-fielded against
+        its own reference frame."""
+        if (cube is None or not self.chk_flat.isChecked()
+                or self.wavelengths is None or not len(self.wavelengths)):
+            return cube
+        wl = np.asarray(self.wavelengths, float)
+        idx = int(np.argmin(np.abs(wl - self.spin_flat_wl.value())))
+        frame = cube[idx].astype(np.float32)
+        fmax = float(np.nanmax(np.abs(frame))) if frame.size else 0.0
+        if fmax <= 0:
+            return cube
+        unit = frame / fmax                          # unitary flat: peak = 1
+        safe = np.where(np.abs(unit) < 1e-6, np.nan, unit)
+        return (cube / safe[None, :, :]).astype(np.float32)
+
+    def _on_flat_toggled(self, *a):
+        # Base cube is unchanged; only the post-processing. Invalidate the ratio/bg
+        # caches (their input changed) and redraw.
+        self._bg_sig = None; self._ratio_sig = None
+        self.refresh_map(); self.update_spectra(); self._update_phase()
 
     def _apply_background(self, cube):
         """Subtract the chosen background ROI's average spectrum from every pixel.
@@ -2566,6 +2614,75 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 np.savez(os.path.join(out, base + "_rewin.npz"), **kw)  # uncompressed: fast write
                 saved += 1
             self.statusBar().showMessage(f"recomputed + saved {saved} position(s) to {out}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _processed_cube(self, zi):
+        """(wl, cube) for file `zi` with the CURRENT Process settings applied
+        (ROI crop, SVD, flat-field, reference division, background ROI) -- i.e.
+        exactly what the maps show, computed from the loaded spectrum cube."""
+        wl = self.infos[zi].get("wavelengths")
+        wl = np.asarray(wl) if wl is not None else self._saved_wavelengths
+        cube = _load_cube(self.infos[zi]["path"], self.infos[zi].get("map_index"))
+        if cube is None:
+            return (np.asarray(wl) if wl is not None else None), None
+        cube = self._work_crop3(cube)
+        if self.chk_svd.isChecked():
+            cube = A.svd_denoise(cube, self.spin_k.value())
+        old = self.wavelengths                       # flat-field/ratio use self.wavelengths
+        self.wavelengths = np.asarray(wl) if wl is not None else old
+        try:
+            out = self._apply_background(self._apply_ratio(self._apply_flatfield(cube)))
+        finally:
+            self.wavelengths = old
+        return (np.asarray(wl) if wl is not None else None), out
+
+    def export_processed_cubes(self):
+        """Save every loaded file as a new .npz with the current Process settings
+        (flat-field, reference division, background ROI, SVD) baked into the
+        spectrum cube -- one output per input file, same z/angle + metadata."""
+        if not self.infos:
+            self.statusBar().showMessage("Load a dataset first."); return
+        if self.recompute_on:
+            self.statusBar().showMessage(
+                "Turn off 'Recompute' to export processed spectrum cubes.", 6000); return
+        out = QtWidgets.QFileDialog.getExistingDirectory(self, "Save processed cubes to…")
+        if not out:
+            return
+        proc = dict(flat_field=bool(self.chk_flat.isChecked()),
+                    flat_field_wl_um=(self.spin_flat_wl.value()
+                                      if self.chk_flat.isChecked() else None),
+                    divide_by_reference=bool(self.chk_ratio.isChecked()
+                                             and self.ref_cube_full is not None),
+                    reference=self.ref_cube_name,
+                    background_roi=bool(self.chk_bg.isChecked()),
+                    svd_k=(self.spin_k.value() if self.chk_svd.isChecked() else None),
+                    roi=bool(self.chk_work.isChecked()))
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        saved = 0
+        try:
+            for k, info in enumerate(self.infos):
+                self.statusBar().showMessage(f"processing {k+1}/{len(self.infos)}…")
+                QtWidgets.QApplication.processEvents()
+                wl, cube = self._processed_cube(k)
+                if cube is None:
+                    continue
+                meta = dict(info.get("metadata", {}) or {})
+                meta["processing"] = proc
+                kw = dict(spectrum_cube=np.asarray(cube, np.float32),
+                          metadata=np.array(meta, dtype=object),
+                          metadata_json=json.dumps(meta, default=str, indent=2))
+                if wl is not None:
+                    kw["wavelengths"] = np.asarray(wl)
+                if info.get("z") is not None:
+                    kw["z_value_mm"] = info["z"]; kw["z_unit"] = "mm"
+                ang = (info.get("metadata", {}) or {}).get("angle_value_deg")
+                if ang is not None:
+                    kw["angle_value_deg"] = ang
+                base = os.path.splitext(os.path.basename(info["path"]))[0]
+                np.savez(os.path.join(out, base + "_proc.npz"), **kw)
+                saved += 1
+            self.statusBar().showMessage(f"saved {saved} processed cube(s) to {out}")
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
