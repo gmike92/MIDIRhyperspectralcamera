@@ -863,8 +863,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         btn_phase_stack.setToolTip("Phase-correct every cube in the loaded stack with the "
                                    "background and save the phased spectrum cubes to a folder.")
         btn_phase_stack.clicked.connect(self._phase_stack_save)
+        self.chk_save_complex = QtWidgets.QCheckBox("save complex")
+        self.chk_save_complex.setToolTip("Save the COMPLEX spectrum G = F·e^{-iΦ} "
+                                         "(amplitude + phase, complex64) instead of the "
+                                         "real/absorptive part, so phase is preserved.")
         pb.addWidget(btn_bkg); pb.addWidget(self.chk_phase_bkg)
-        pb.addWidget(btn_phase_stack); pb.addStretch(1)
+        pb.addWidget(btn_phase_stack); pb.addWidget(self.chk_save_complex); pb.addStretch(1)
         ph.addLayout(pb)
         self.lbl_phase_bkg = QtWidgets.QLabel("Background: none loaded.")
         self.lbl_phase_bkg.setStyleSheet("color:#888;"); self.lbl_phase_bkg.setWordWrap(True)
@@ -2221,11 +2225,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                     skipped += 1
                     continue
                 nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
+                complex_out = self.chk_save_complex.isChecked()
                 wl, cube = self.proc.compute_hyperspectral(
                     pos, raw_b, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
                     search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
-                    reference_cube=ref_raw, center_method=cmethod)
+                    reference_cube=ref_raw, center_method=cmethod, complex_out=complex_out)
                 if cube is None:
                     skipped += 1
                     continue
@@ -2233,9 +2238,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 meta.update(phase_corrected=True,
                             phase_background=os.path.basename(self.phase_bkg[2]),
                             recompute_window_mm=win, recompute_apod=apod,
-                            recompute_nfreq=int(nfreq),
+                            recompute_nfreq=int(nfreq), complex_spectrum=bool(complex_out),
                             raw_binning=1, spectrum_binning=self._recompute_bin())
-                kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
+                # complex64 keeps phase; else the real absorptive part as before.
+                sc = cube.astype(np.complex64) if complex_out else cube.astype(np.float32)
+                kw = dict(wavelengths=wl, spectrum_cube=sc,
                           raw_interferogram=np.asarray(raw, np.float32),
                           metadata=np.array(meta, dtype=object),
                           metadata_json=json.dumps(meta, default=str, indent=2))

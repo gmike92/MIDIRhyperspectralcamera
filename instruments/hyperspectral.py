@@ -226,7 +226,7 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               apod_width=None, n_freq=200, reference_cube=None, invert=False,
+                               apod_width=None, n_freq=200, reference_cube=None,
                                expected_zero_mm=None, search_mm=None,
                                apod_type="happ-genzel", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
@@ -289,13 +289,6 @@ class HyperspectralProcessor:
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] KSpace: walk-off correction skipped: {e}")
 
-        if invert:
-            datacube = -datacube
-            if reference_cube is not None:
-                reference_cube = -reference_cube
-
-        sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
-
         per_pixel = str(center_method).lower().startswith("bary")
 
         # Helper for baseline & apodization
@@ -326,30 +319,6 @@ class HyperspectralProcessor:
                 center = find_centerburst(interf_1d, c_pos, expected_zero_mm, search_mm)
 
             scalar = np.ndim(center) == 0
-
-            # Symmetrisation only makes sense for one shared centre; skip it for a
-            # per-pixel map (the position axis is common to all pixels).
-            if sym_flag and scalar:
-                center_idx = int(center)
-                left_len = center_idx
-                right_len = len(sig) - 1 - center_idx
-
-                if right_len > left_len:
-                    tail = sig[center_idx + 1:]
-                    sym_signal = np.concatenate([tail[::-1], sig[center_idx:center_idx+1], tail], axis=0)
-                    pos_diffs = c_pos[center_idx + 1:] - c_pos[center_idx]
-                    mirrored_pos = c_pos[center_idx] - pos_diffs[::-1]
-                    sym_positions = np.concatenate([mirrored_pos, [c_pos[center_idx]], c_pos[center_idx + 1:]])
-                else:
-                    tail = sig[:center_idx]
-                    sym_signal = np.concatenate([tail, sig[center_idx:center_idx+1], tail[::-1]], axis=0)
-                    pos_diffs = c_pos[center_idx] - c_pos[:center_idx]
-                    mirrored_pos = c_pos[center_idx] + pos_diffs[::-1]
-                    sym_positions = np.concatenate([c_pos[:center_idx], [c_pos[center_idx]], mirrored_pos])
-
-                sig = sym_signal
-                c_pos = sym_positions
-                center = center_idx = len(sig) // 2
 
             cpos_c = c_pos[center]                  # scalar, or (h, w) per-pixel
             try:

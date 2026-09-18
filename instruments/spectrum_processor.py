@@ -271,7 +271,7 @@ class SpectrumProcessor:
             return None, None
 
     def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         apod_width=None, n_points=10000, invert=False, symmetrize=False,
+                         apod_width=None, n_points=10000, symmetrize=False,
                          expected_zero_mm=None, search_mm=None, apod_type="happ-genzel"):
         """Compute spectrum from interferogram using DFT."""
         if self.interferogram is None or self.positions is None:
@@ -280,9 +280,6 @@ class SpectrumProcessor:
         window_size = max(1, len(self.interferogram) // 5)
         baseline = self.moving_average(self.interferogram, window_size)
         signal = self.interferogram - baseline
-
-        if invert:
-            signal = -signal
 
         # Remove the TWINS wedge motor's reproducible nonlinearity (no-op if the
         # parameters_int.txt position calibration isn't present).
