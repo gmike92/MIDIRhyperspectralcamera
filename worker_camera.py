@@ -198,6 +198,13 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                     should_stream = camera is not None and camera.status.acquiring
                     last_frame_time = time.time()
                     continue
+                if cmd_type == "disconnect":
+                    if camera is not None:
+                        camera.stop_acquisition()
+                        camera.disconnect()
+                        publish_status(frame_queue, camera.get_status())
+                    should_stream = False
+                    continue
                 if cmd_type == "read_temp":
                     if hasattr(camera, "refresh_temperatures"):
                         try:
