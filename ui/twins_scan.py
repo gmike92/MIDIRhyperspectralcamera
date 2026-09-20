@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 
 from instruments.subtwinslv import TwinsScanner
 from instruments.spectrum_processor import (
-    DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS, DEFAULT_APODIZATION,
+    DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
     DEFAULT_WL_START, DEFAULT_WL_STOP,
 )
 from instruments.dsp import APOD_TYPES

@@ -196,7 +196,7 @@ captured once; `_run_target()` returns `(folder, stamp, fname)`). Z targets =
   so a later crash never loses acquired data.
 - **Phase 2 — TRANSFORM every acquired cube + save.** For each: optional saturation mask,
   `resolve_n_points` (Auto = 1.5× steps, clamped [512,4096]), `compute_hyperspectral(...)`,
-  optional SVD denoise, then **overwrite** the same file with the spectrum (compressed,
+  then **overwrite** the same file with the spectrum (compressed,
   `processing_stage="complete"`). Single maps autosave the whole cube; Z-scans keep the
   per-position files and `_on_done` skips the whole-set autosave.
 
@@ -250,7 +250,7 @@ and a calibration badge via `set_calibration_note(meta)`. `set_result` (in-RAM) 
 
 ### Metadata captured at scan start (`_scan_meta` + `_cam_meta`)
 start/stop/steps/step_um, frames/point, binning, ROI, apodization+width, wl range,
-n_freq setting, ZPD, walk-off, background_subtracted, saturation level, svd, zscan,
+n_freq setting, ZPD, background_subtracted, saturation level, zscan,
 filename — plus the camera dict from `meta_provider`.
 
 ---
@@ -266,8 +266,6 @@ filename — plus the camera dict from `meta_provider`.
   super-gaussian) **asymmetric-aware**; FWHM-based resolution estimate.
 - `analysis.py` — cube analysis: `saturation_mask`, `roi_average`, `svd_denoise`,
   `svd_explained_variance`, peak maps, `spectral_derivative`, `spectral_angle_map`.
-- `walkoff.py` — TWINS wedge walk-off correction (per-frame parametric shift +
-  phase-correlation registration). Wired into `compute_hyperspectral(walkoff=...)`.
 - `spectrum_processor.py` / `hyperspectral.py` — the 1-D and 2-D processors (same math,
   different output dimensionality).
 
@@ -314,5 +312,5 @@ filename — plus the camera dict from `meta_provider`.
 | `gui/instruments/subtwinslv.py` | TwinsScanner: step-scan engine (`scan`, `scan_cube`) |
 | `gui/instruments/hyperspectral.py` | 2-D per-pixel DFT (`compute_hyperspectral`) |
 | `gui/instruments/spectrum_processor.py` | 1-D interferogram → spectrum |
-| `gui/instruments/{calibration,dsp,analysis,walkoff}.py` | shared processing |
+| `gui/instruments/{calibration,dsp,analysis}.py` | shared processing |
 | `gui/Twins/ASRC calibration/parameters_{cal,int}.txt` | spectral + motor calibration data |

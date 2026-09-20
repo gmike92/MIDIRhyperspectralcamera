@@ -52,7 +52,7 @@ def _free_gb(path):
 from instruments.subtwinslv import TwinsScanner
 from instruments.hyperspectral import (
     HyperspectralProcessor, DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
-    DEFAULT_APODIZATION, DEFAULT_WL_START, DEFAULT_WL_STOP,
+    DEFAULT_WL_START, DEFAULT_WL_STOP,
     ZEROFILL_FACTOR, ZEROFILL_MIN, ZEROFILL_MAX, resolve_n_points,
     DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM,
 )
@@ -518,12 +518,9 @@ class MeasurePanel(QWidget):
         self.cubes = []
         self.z_values = []
         self.sat_masks = []
-        # Raw interferogram cubes + positions (per z), kept for optional saving
-        # and for walk-off calibration from a sharp-sample scan.
+        # Raw interferogram cubes + positions (per z), kept for optional saving.
         self.raw_cubes = []
         self.raw_positions = []
-        self._last_datacube = None
-        self._last_positions = None
         # Per-run save folder (set on each Acquire in _start); all of a run's
         # files land in <run-stamp>.<filename>/ under the camera folder.
         self._run_folder = None
@@ -541,7 +538,6 @@ class MeasurePanel(QWidget):
         layout.addWidget(self._build_scan_group())
         layout.addWidget(self._build_spectrum_group())
         layout.addWidget(self._build_postproc_group())
-        layout.addWidget(self._build_walkoff_group())
         layout.addWidget(self._build_zscan_group())
         layout.addWidget(self._build_ascan_group())
         layout.addWidget(self._build_run_group())
@@ -556,10 +552,9 @@ class MeasurePanel(QWidget):
             widget.valueChanged.connect(self._save_settings)
         self.combo_apod.currentTextChanged.connect(self._save_settings)
         self.combo_ftregion.currentTextChanged.connect(self._save_settings)
-        self.chk_walkoff.toggled.connect(self._save_settings)
         self.combo_save.currentTextChanged.connect(self._save_settings)
         self.chk_save_raw.toggled.connect(self._save_settings)
-        for chk in self._persisted_checks().values():   # sat, svd, zscan, zones
+        for chk in self._persisted_checks().values():   # sat, zscan, zones
             chk.toggled.connect(self._save_settings)
         self.edit_filename.editingFinished.connect(self._save_settings)
 
@@ -723,67 +718,7 @@ class MeasurePanel(QWidget):
         self.spin_sat.setToolTip("Saturation count level (Orca 16-bit full scale = 65535).")
         grid.addWidget(QLabel("Saturation level"), 1, 0); grid.addWidget(self.spin_sat, 1, 1)
 
-        self.chk_svd = QCheckBox("SVD denoise (low-rank)")
-        self.chk_svd.setToolTip("Keep the k strongest SVD components of the cube; "
-                                "removes spatially-incoherent noise.")
-        grid.addWidget(self.chk_svd, 2, 0, 1, 2)
-        self.spin_svd_k = QSpinBox(); self.spin_svd_k.setRange(1, 64); self.spin_svd_k.setValue(6)
-        self.spin_svd_k.setToolTip("Number of spectral components to keep.")
-        grid.addWidget(QLabel("Components (k)"), 3, 0); grid.addWidget(self.spin_svd_k, 3, 1)
         return g
-
-    def _build_walkoff_group(self) -> QGroupBox:
-        g = QGroupBox("Walk-off correction (TWINS image drift)")
-        grid = QGridLayout(g)
-        hint = QLabel("Calibrate the per-frame image shift ONCE on a sharp, "
-                      "high-contrast target, then apply it to every scan.")
-        hint.setWordWrap(True); hint.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(hint, 0, 0, 1, 2)
-
-        self.chk_walkoff = QCheckBox("Apply walk-off correction")
-        grid.addWidget(self.chk_walkoff, 1, 0, 1, 2)
-
-        self.spin_wo_y = self._wo_spin(); self.spin_wo_x = self._wo_spin()
-        grid.addWidget(QLabel("Rate Y (px/mm)"), 2, 0); grid.addWidget(self.spin_wo_y, 2, 1)
-        grid.addWidget(QLabel("Rate X (px/mm)"), 3, 0); grid.addWidget(self.spin_wo_x, 3, 1)
-
-        self.btn_wo_cal = QPushButton("Calibrate from last scan")
-        self.btn_wo_cal.setToolTip("Register the frames of the most recent scan "
-                                   "(use a sharp sample) and fit the shift rate.")
-        self.btn_wo_cal.clicked.connect(self._calibrate_walkoff)
-        grid.addWidget(self.btn_wo_cal, 4, 0, 1, 2)
-
-        self.lbl_wo = QLabel("not calibrated")
-        self.lbl_wo.setWordWrap(True); self.lbl_wo.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(self.lbl_wo, 5, 0, 1, 2)
-        return g
-
-    def _wo_spin(self):
-        s = QDoubleSpinBox(); s.setRange(-1000.0, 1000.0); s.setDecimals(4)
-        s.setSingleStep(0.1); s.setValue(0.0); s.setSuffix(" px/mm"); return s
-
-    def _calibrate_walkoff(self) -> None:
-        cube = self._last_datacube
-        pos = self._last_positions
-        if cube is None or pos is None:
-            self.lbl_wo.setText("Run a scan on a sharp sample first, then calibrate.")
-            return
-        self.lbl_wo.setText("calibrating (registering frames)...")
-        self.btn_wo_cal.setEnabled(False)
-        try:
-            from instruments.walkoff import estimate_shift_rate
-            est = estimate_shift_rate(cube, pos)
-            self.spin_wo_y.setValue(est["rate_y"])
-            self.spin_wo_x.setValue(est["rate_x"])
-            self.chk_walkoff.setChecked(True)
-            self.lbl_wo.setText(
-                f"rate_y={est['rate_y']:.3f} (r²={est['r2_y']:.2f}), "
-                f"rate_x={est['rate_x']:.3f} (r²={est['r2_x']:.2f}) px/mm — "
-                f"low r² ⇒ not a clean linear drift / use a sharper sample.")
-        except Exception as e:  # noqa: BLE001
-            self.lbl_wo.setText(f"calibration error: {e}")
-        finally:
-            self.btn_wo_cal.setEnabled(True)
 
     # Default zones: (enabled, start_mm, stop_mm, step_um). Three fixed zones so
     # you can e.g. sample finely near focus and coarsely far from it in one scan.
@@ -1013,16 +948,13 @@ class MeasurePanel(QWidget):
             "ks_wl0": (self.spin_wl0, float),
             "ks_wl1": (self.spin_wl1, float),
             "ks_nfreq": (self.spin_nfreq, int),
-            "ks_wo_y": (self.spin_wo_y, float),
-            "ks_wo_x": (self.spin_wo_x, float),
             "ks_sat_level": (self.spin_sat, int),
-            "ks_svd_k": (self.spin_svd_k, int),
             "ks_ftwidth": (self.spin_ftwidth, float),
         }
 
     def _persisted_checks(self) -> dict:
         """key -> checkbox widgets persisted between measurements."""
-        checks = {"ks_sat_on": self.chk_sat, "ks_svd_on": self.chk_svd,
+        checks = {"ks_sat_on": self.chk_sat,
                   "ks_zscan_on": self.chk_zscan, "ks_ascan_on": self.chk_ascan}
         for i, zr in enumerate(self.zone_rows):
             checks[f"ks_zone{i}_on"] = zr["chk"]
@@ -1039,7 +971,12 @@ class MeasurePanel(QWidget):
         keys = legacy.allKeys()
         if not keys:
             return
+        # Settings of features this panel no longer has (SVD denoise, walk-off
+        # correction): leave them behind instead of copying dead keys forward.
+        dropped = ("ks_svd_", "ks_wo_", "ks_walkoff_")
         for key in keys:
+            if key.startswith(dropped):
+                continue
             # the old default base filename is renamed too -- let the new one win
             if key == "ks_filename" and str(legacy.value(key)).strip() == "kspace":
                 continue
@@ -1064,9 +1001,6 @@ class MeasurePanel(QWidget):
         ctr = self._settings.value("ks_apod_center", None)
         if ctr is not None:
             self.combo_center.setCurrentText(str(ctr))
-        wo = self._settings.value("ks_walkoff_on", None)
-        if wo is not None:
-            self.chk_walkoff.setChecked(str(wo).lower() == "true")
         save_mode = self._settings.value("ks_save_mode", None)
         if save_mode is not None:
             self.combo_save.setCurrentText(str(save_mode))
@@ -1084,7 +1018,6 @@ class MeasurePanel(QWidget):
         self._settings.setValue("ks_apod_type", self.combo_apod.currentText())
         self._settings.setValue("ks_ftregion", self.combo_ftregion.currentText())
         self._settings.setValue("ks_apod_center", self.combo_center.currentText())
-        self._settings.setValue("ks_walkoff_on", self.chk_walkoff.isChecked())
         self._settings.setValue("ks_save_mode", self.combo_save.currentText())
         for key, chk in self._persisted_checks().items():
             self._settings.setValue(key, chk.isChecked())
@@ -1206,8 +1139,6 @@ class MeasurePanel(QWidget):
             r0, r1, c0, c1 = roi
             self.sig_status.emit(f"ROI saved for scan: rows {r0}-{r1}, cols {c0}-{c1}")
 
-        walkoff = (dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
-                   if self.chk_walkoff.isChecked() else None)
         # Snapshot the captured background (full frame) + whether to subtract it,
         # taken now so it can't change mid-scan.
         bg, bg_sub = self.bg_provider() if self.bg_provider else (None, False)
@@ -1221,10 +1152,8 @@ class MeasurePanel(QWidget):
             apod_type=self.combo_apod.currentText(),
             wl0=self.spin_wl0.value(),
             wl1=self.spin_wl1.value(), nfreq=self.spin_nfreq.value(),
-            walkoff=walkoff,
             background=bg, bg_subtract=bool(bg_sub and bg is not None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
             ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
             center_method=self._center_method(),
             zscan=zscan, z_targets=z_targets,
@@ -1241,9 +1170,8 @@ class MeasurePanel(QWidget):
             apodization=params["apod_type"],
             wl_start_um=params["wl0"], wl_stop_um=params["wl1"],
             n_freq_setting=params["nfreq"], expected_zpd_mm=DEFAULT_ZPD_MM,
-            walkoff=walkoff, background_subtracted=params["bg_subtract"],
+            background_subtracted=params["bg_subtract"],
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
-            svd_denoise=params["svd_on"], svd_k=params["svd_k"],
             ft_region=params["ft_region"], ft_width_mm=params["ft_width"],
             apod_center=params["center_method"],
             zscan=zscan, filename=self.edit_filename.text().strip() or "hyperspectral",
@@ -1347,7 +1275,7 @@ class MeasurePanel(QWidget):
 
     def _recompute(self) -> None:
         """Re-run the DFT on the last scan's RAW interferogram with the current
-        settings (FT region, apodization, λ, denoise) -- no re-scan. Lets you
+        settings (FT region, apodization, λ) -- no re-scan. Lets you
         compare e.g. center vs tails on already-acquired data."""
         if not getattr(self, "raw_cubes", None):
             self.lbl_status.setText("no raw data to recompute -- run a scan first")
@@ -1356,10 +1284,7 @@ class MeasurePanel(QWidget):
             wl0=self.spin_wl0.value(), wl1=self.spin_wl1.value(),
             nfreq=self.spin_nfreq.value(),
             apod_type=self.combo_apod.currentText(),
-            walkoff=(dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
-                     if self.chk_walkoff.isChecked() else None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
             ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
             center_method=self._center_method(),
         )
@@ -1368,8 +1293,7 @@ class MeasurePanel(QWidget):
             ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
             apodization=p["apod_type"],
             wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
-            apod_center=p["center_method"],
-            svd_denoise=p["svd_on"], svd_k=p["svd_k"], recomputed=True)
+            apod_center=p["center_method"], recomputed=True)
         self._per_position_saved = False   # recompute result is saved as one set
         self.btn_run.setEnabled(False)
         self.btn_recompute.setEnabled(False)
@@ -1378,7 +1302,7 @@ class MeasurePanel(QWidget):
 
     def _recompute_worker(self, p: dict) -> None:
         try:
-            from instruments.analysis import saturation_mask, svd_denoise
+            from instruments.analysis import saturation_mask
             proc = HyperspectralProcessor()
             cubes, masks, wls = [], [], None
             for positions, datacube in zip(self.raw_positions, self.raw_cubes):
@@ -1394,13 +1318,11 @@ class MeasurePanel(QWidget):
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
                     n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-                    apod_type=p["apod_type"], walkoff=p["walkoff"],
+                    apod_type=p["apod_type"],
                     ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
                     center_method=p["center_method"])
                 if cube is None:
                     continue
-                if p["svd_on"]:
-                    cube = svd_denoise(cube, p["svd_k"])
                 wls = wl
                 cubes.append(cube)
                 masks.append(sat_mask)
@@ -1517,7 +1439,7 @@ class MeasurePanel(QWidget):
 
     def _worker(self, p: dict) -> None:
         try:
-            from instruments.analysis import saturation_mask, svd_denoise
+            from instruments.analysis import saturation_mask
             from instruments.subtwinslv import bin_image
             scanner = TwinsScanner(self.sp.twins, self.frame_source)
             proc = HyperspectralProcessor()
@@ -1596,10 +1518,6 @@ class MeasurePanel(QWidget):
 
                     if datacube is None or len(positions) < 3:
                         continue
-                    # Keep the last raw cube so walk-off can be calibrated from it
-                    # later (use a sharp-sample scan).
-                    self._last_datacube = datacube
-                    self._last_positions = positions
                     acquired.append({"z": z, "zi": zi, "a": a, "ai": ai, "gi": g,
                                      "positions": np.asarray(positions),
                                      "datacube": np.asarray(datacube)})
@@ -1664,14 +1582,11 @@ class MeasurePanel(QWidget):
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
                     n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-                    apod_type=p["apod_type"], walkoff=p["walkoff"],
+                    apod_type=p["apod_type"],
                     ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
                     center_method=p["center_method"])
                 if cube is None:
                     continue
-                if p["svd_on"]:
-                    self.sig_status.emit(f"FFT {k+1}/{n_acq}: SVD denoise (k={p['svd_k']})...")
-                    cube = svd_denoise(cube, p["svd_k"])
                 wls = wl
                 cubes.append(cube)
                 # Viewer slider value: the Z position, or the angle for an

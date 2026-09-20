@@ -97,7 +97,7 @@ controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
     subtwinslv.py         step-scan engine (scan / scan_cube)
     hyperspectral.py      2-D per-pixel DFT (compute_hyperspectral)
     spectrum_processor.py 1-D interferogram -> spectrum
-    calibration.py dsp.py analysis.py walkoff.py   shared processing
+    calibration.py dsp.py analysis.py   shared processing
   Twins/ASRC calibration/ parameters_{cal,int}.txt  spectral + motor calibration
   analysis_app.py       standalone Z-series hyperspectral analyzer
   view_hyperspectral.py standalone cube viewer

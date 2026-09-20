@@ -1,11 +1,12 @@
 """
 spectrum_processor.py -- interferogram -> spectrum DFT.
 
-Copied verbatim from the pump-probe repo (gmike92/Labview-pumprobepython,
-sub_twins_lw.SpectrumProcessor) so the TWINS spectrum math here is identical to
-the reference setup: moving-average baseline removal, NIREOS Gaussian
-apodization, explicit DFT, and a calibration file mapping pseudo-frequency to
-real wavelength (µm).
+Ported from the pump-probe repo (gmike92/Labview-pumprobepython,
+sub_twins_lw.SpectrumProcessor) so the TWINS spectrum math here matches the
+reference setup: moving-average baseline removal, explicit DFT, and a
+calibration file mapping pseudo-frequency to real wavelength (µm). The
+apodization window is the symmetric, ZPD-centred one from instruments.dsp
+(selected by name -- no width parameter).
 
 Defaults and the calibration-file path match the repo. If the calibration file
 is absent it falls back to a plain 1/frequency conversion.
@@ -20,7 +21,6 @@ from pathlib import Path
 DEFAULT_START_MM = 23.8     # Default start position (mm)
 DEFAULT_STOP_MM = 24.8      # Default stop position (mm)
 DEFAULT_N_STEPS = 120       # Default number of steps
-DEFAULT_APODIZATION = 0.2   # Apodization width
 DEFAULT_WL_START = 8.0      # Spectrum display start (µm)
 DEFAULT_WL_STOP = 14.0      # Spectrum display stop (µm)
 
@@ -35,10 +35,6 @@ ZEROFILL_FACTOR = 1.5
 ZEROFILL_MIN = 512
 ZEROFILL_MAX = 4096
 
-# Centerburst (ZPD) search defaults (NIREOS TWINS wedge).
-DEFAULT_ZPD_MM = 24.33
-DEFAULT_ZPD_WINDOW_MM = 0.1
-
 
 def resolve_n_points(n_steps, manual=None):
     """Spectral output bins (interpolation only). manual>0 wins; else "Auto" =
@@ -48,15 +44,13 @@ def resolve_n_points(n_steps, manual=None):
     return int(np.clip(ZEROFILL_FACTOR * int(n_steps), ZEROFILL_MIN, ZEROFILL_MAX))
 
 
-def find_centerburst(signal_1d, positions, expected_zero_mm=None, search_mm=None):
+def find_centerburst(signal_1d):
     """Locate the ZPD (center burst) index from a 1-D interferogram.
 
     Uses the analytic-signal (Hilbert) envelope rather than argmax(|signal|):
     the envelope is smooth, so it picks the true burst instead of jumping to the
-    tallest individual fringe or to a baseline edge artifact. If
-    ``expected_zero_mm`` is given the search is limited to +/- ``search_mm``
-    around it (default 5% of the scan span); otherwise the outer ~3% of points
-    are excluded so baseline roll-off at the ends can't win.
+    tallest individual fringe or to a baseline edge artifact. The outer ~3% of
+    the points are excluded so baseline roll-off at the ends can't win.
     """
     s = np.asarray(signal_1d, dtype=float).ravel()
     n = s.size
@@ -68,19 +62,10 @@ def find_centerburst(signal_1d, positions, expected_zero_mm=None, search_mm=None
     except Exception:  # noqa: BLE001
         env = np.abs(s - s.mean())
 
-    pos = np.asarray(positions, dtype=float).ravel()
-    span = abs(pos[-1] - pos[0]) if n > 1 else 0.0
-
     mask = np.ones(n, dtype=bool)
-    if expected_zero_mm is not None and span > 0:
-        hw = search_mm if search_mm is not None else max(0.05 * span, 3.0 * span / n)
-        mask = np.abs(pos - float(expected_zero_mm)) <= hw
-        if not mask.any():
-            mask = np.ones(n, dtype=bool)
-    else:
-        guard = max(1, int(0.03 * n))
-        mask[:guard] = False
-        mask[-guard:] = False
+    guard = max(1, int(0.03 * n))
+    mask[:guard] = False
+    mask[-guard:] = False
     return int(np.argmax(np.where(mask, env, -np.inf)))
 
 
@@ -141,45 +126,6 @@ class SpectrumProcessor:
         import pandas as pd
         ser = pd.Series(data)
         return ser.rolling(window=window, min_periods=1, center=True).mean().to_numpy()
-
-    def apodization(self, data, positions, width=0.2, center_idx=None):
-        """Apply Gaussian apodization window (NIREOS formula)."""
-        if center_idx is None:
-            center_idx = find_centerburst(data, positions)
-
-        try:
-            print(f"[SpectrumProcessor] Computed ZERO (burst center): {positions[center_idx]:.4f} mm (index {center_idx})")
-        except Exception:
-            pass
-
-        # Shift positions so that center burst is mathematically exactly 0
-        shifted_positions = positions - positions[center_idx]
-
-        left_pos = shifted_positions[:center_idx + 1]
-        right_pos = shifted_positions[center_idx + 1:]
-
-        if len(left_pos) > 0 and left_pos[0] != 0:
-            left_gauss = np.exp(-np.power(left_pos, 2) /
-                                (2 * np.power(left_pos[0] * width * 2, 2)))
-        else:
-            left_gauss = np.ones_like(left_pos)
-
-        if len(right_pos) > 0 and right_pos[-1] != 0:
-            right_gauss = np.exp(-np.power(right_pos, 2) /
-                                 (2 * np.power(right_pos[-1] * width * 2, 2)))
-        else:
-            right_gauss = np.ones_like(right_pos)
-
-        window = np.concatenate([left_gauss, right_gauss])
-
-        if len(window) != len(data):
-            window = np.interp(
-                np.linspace(0, 1, len(data)),
-                np.linspace(0, 1, len(window)),
-                window
-            )
-
-        return data * window
 
     def _get_frequency_limits(self, wl_start, wl_stop):
         if self.wavelength_cal is not None and self.reciprocal_cal is not None:
@@ -270,9 +216,8 @@ class SpectrumProcessor:
         except Exception:  # noqa: BLE001
             return None, None
 
-    def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         apod_width=None, n_points=10000, invert=False, symmetrize=False,
-                         expected_zero_mm=None, search_mm=None, apod_type="happ-genzel"):
+    def compute_spectrum(self, wl_start=8.0, wl_stop=14.0, n_points=10000,
+                         apod_type="happ-genzel"):
         """Compute spectrum from interferogram using DFT."""
         if self.interferogram is None or self.positions is None:
             return None, None
@@ -280,9 +225,6 @@ class SpectrumProcessor:
         window_size = max(1, len(self.interferogram) // 5)
         baseline = self.moving_average(self.interferogram, window_size)
         signal = self.interferogram - baseline
-
-        if invert:
-            signal = -signal
 
         # Remove the TWINS wedge motor's reproducible nonlinearity (no-op if the
         # parameters_int.txt position calibration isn't present).
@@ -293,37 +235,13 @@ class SpectrumProcessor:
             print(f"[WARN] motor calibration skipped: {e}")
             c_positions = np.asarray(self.positions, dtype=float)
 
-        center_idx = find_centerburst(signal, c_positions, expected_zero_mm, search_mm)
+        center_idx = find_centerburst(signal)
         try:
             print(f"[SpectrumProcessor] ZPD (burst center): "
                   f"{c_positions[center_idx]:.4f} mm (index {center_idx})")
         except Exception:  # noqa: BLE001
             pass
 
-        if symmetrize:
-            c_idx = center_idx
-            left_len = c_idx
-            right_len = len(signal) - 1 - c_idx
-
-            if right_len > left_len:
-                tail = signal[c_idx + 1:]
-                sym_signal = np.concatenate([tail[::-1], [signal[c_idx]], tail])
-                pos_diffs = c_positions[c_idx + 1:] - c_positions[c_idx]
-                mirrored_pos = c_positions[c_idx] - pos_diffs[::-1]
-                sym_positions = np.concatenate([mirrored_pos, [c_positions[c_idx]], c_positions[c_idx + 1:]])
-            else:
-                tail = signal[:c_idx]
-                sym_signal = np.concatenate([tail, [signal[c_idx]], tail[::-1]])
-                pos_diffs = c_positions[c_idx] - c_positions[:c_idx]
-                mirrored_pos = c_positions[c_idx] + pos_diffs[::-1]
-                sym_positions = np.concatenate([c_positions[:c_idx], [c_positions[c_idx]], mirrored_pos])
-
-            signal = sym_signal
-            c_positions = sym_positions
-            center_idx = len(signal) // 2
-            self.center_idx = center_idx
-
-        self.symmetrized_signal = signal
         # SYMMETRIC apodization window centred at the ZPD (no width param).
         from instruments.dsp import apodization_window
         window = apodization_window(apod_type, len(signal), center_idx)

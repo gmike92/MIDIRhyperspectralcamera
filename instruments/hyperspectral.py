@@ -17,7 +17,6 @@ from pathlib import Path
 DEFAULT_START_MM = 23.8
 DEFAULT_STOP_MM = 24.8
 DEFAULT_N_STEPS = 100
-DEFAULT_APODIZATION = 0.2
 DEFAULT_WL_START = 8.0       # µm
 DEFAULT_WL_STOP = 14.0       # µm
 
@@ -226,9 +225,9 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               apod_width=None, n_freq=200, reference_cube=None, invert=False,
+                               n_freq=200, reference_cube=None,
                                expected_zero_mm=None, search_mm=None,
-                               apod_type="happ-genzel", walkoff=None,
+                               apod_type="happ-genzel",
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
                                positions_calibrated=False, center_method="envelope"):
         """
@@ -266,30 +265,6 @@ class HyperspectralProcessor:
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Hyperspectral: motor calibration skipped: {e}")
 
-        # Walk-off correction: shift every frame back onto a common grid so each
-        # pixel sees the same scene point across the scan (parametric rate from a
-        # sharp-sample calibration). walkoff = {rate_y, rate_x, ref_mm}.
-        if walkoff:
-            try:
-                from instruments.walkoff import apply_walkoff_correction
-                ry = float(walkoff.get("rate_y", 0.0))
-                rx = float(walkoff.get("rate_x", 0.0))
-                rm = walkoff.get("ref_mm", None)
-                datacube = apply_walkoff_correction(datacube, positions, ry, rx, rm)
-                if reference_cube is not None:
-                    reference_cube = apply_walkoff_correction(
-                        np.asarray(reference_cube, dtype=float), positions, ry, rx, rm)
-                print(f"[Hyperspectral] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
-            except Exception as e:  # noqa: BLE001
-                print(f"[WARN] Hyperspectral: walk-off correction skipped: {e}")
-
-        if invert:
-            datacube = -datacube
-            if reference_cube is not None:
-                reference_cube = -reference_cube
-
-        sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
-
         per_pixel = str(center_method).lower().startswith("bary")
 
         # Helper for baseline & apodization
@@ -320,30 +295,6 @@ class HyperspectralProcessor:
                 center = find_centerburst(interf_1d, c_pos, expected_zero_mm, search_mm)
 
             scalar = np.ndim(center) == 0
-
-            # Symmetrisation only makes sense for one shared centre; skip it for a
-            # per-pixel map (the position axis is common to all pixels).
-            if sym_flag and scalar:
-                center_idx = int(center)
-                left_len = center_idx
-                right_len = len(sig) - 1 - center_idx
-
-                if right_len > left_len:
-                    tail = sig[center_idx + 1:]
-                    sym_signal = np.concatenate([tail[::-1], sig[center_idx:center_idx+1], tail], axis=0)
-                    pos_diffs = c_pos[center_idx + 1:] - c_pos[center_idx]
-                    mirrored_pos = c_pos[center_idx] - pos_diffs[::-1]
-                    sym_positions = np.concatenate([mirrored_pos, [c_pos[center_idx]], c_pos[center_idx + 1:]])
-                else:
-                    tail = sig[:center_idx]
-                    sym_signal = np.concatenate([tail, sig[center_idx:center_idx+1], tail[::-1]], axis=0)
-                    pos_diffs = c_pos[center_idx] - c_pos[:center_idx]
-                    mirrored_pos = c_pos[center_idx] + pos_diffs[::-1]
-                    sym_positions = np.concatenate([c_pos[:center_idx], [c_pos[center_idx]], mirrored_pos])
-
-                sig = sym_signal
-                c_pos = sym_positions
-                center = center_idx = len(sig) // 2
 
             cpos_c = c_pos[center]                  # scalar, or (h, w) per-pixel
             try:
@@ -430,7 +381,7 @@ class HyperspectralProcessor:
         return wavelengths, spectrum_cube.astype(np.float32)
 
     def compute_complex_map(self, positions, datacube, wavelength_um,
-                            apod_width=None, apod_type="happ-genzel",
+                            apod_type="happ-genzel",
                             expected_zero_mm=None, search_mm=None,
                             ft_window_mm=None, positions_calibrated=False,
                             reference_cube=None, center_method="envelope"):
