@@ -1,5 +1,5 @@
 """
-hyperspectral.py -- per-pixel TWINS DFT (K-space hyperspectral).
+hyperspectral.py -- per-pixel TWINS DFT (hyperspectral datacube).
 
 Verbatim port of the repo's HyperspectralProcessor
 (gmike92/Labview-pumprobepython, sub_kspace_lw.py): takes a 3-D datacube
@@ -135,9 +135,9 @@ class HyperspectralProcessor:
                 ref = pd.read_csv(cal_path, sep="\t", header=None)
                 self.wavelength_cal = ref.iloc[0].to_numpy(dtype='float64')
                 self.reciprocal_cal = ref.iloc[1].to_numpy(dtype='float64')
-                print(f"[OK] KSpace: Loaded calibration: {cal_path.name}")
+                print(f"[OK] Hyperspectral: Loaded calibration: {cal_path.name}")
         except Exception as e:
-            print(f"[WARN] KSpace calibration: {e}")
+            print(f"[WARN] Hyperspectral calibration: {e}")
 
     def _get_frequency_limits(self, wl_start, wl_stop):
         if self.wavelength_cal is not None and self.reciprocal_cal is not None:
@@ -264,7 +264,7 @@ class HyperspectralProcessor:
                 from instruments.calibration import calibrate_position_axis
                 positions = np.asarray(calibrate_position_axis(positions), dtype=float)
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] KSpace: motor calibration skipped: {e}")
+                print(f"[WARN] Hyperspectral: motor calibration skipped: {e}")
 
         # Walk-off correction: shift every frame back onto a common grid so each
         # pixel sees the same scene point across the scan (parametric rate from a
@@ -279,9 +279,9 @@ class HyperspectralProcessor:
                 if reference_cube is not None:
                     reference_cube = apply_walkoff_correction(
                         np.asarray(reference_cube, dtype=float), positions, ry, rx, rm)
-                print(f"[K-Space] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
+                print(f"[Hyperspectral] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] KSpace: walk-off correction skipped: {e}")
+                print(f"[WARN] Hyperspectral: walk-off correction skipped: {e}")
 
         if invert:
             datacube = -datacube
@@ -348,7 +348,7 @@ class HyperspectralProcessor:
             cpos_c = c_pos[center]                  # scalar, or (h, w) per-pixel
             try:
                 _c = float(cpos_c) if scalar else float(np.median(cpos_c))
-                print(f"[K-Space PP] ZPD centre ({center_method}): {_c:.4f} mm"
+                print(f"[Hyperspectral PP] ZPD centre ({center_method}): {_c:.4f} mm"
                       + ("" if scalar else " (per-pixel median)"))
             except Exception:
                 pass
@@ -469,7 +469,7 @@ class HyperspectralProcessor:
                 from instruments.calibration import calibrate_position_axis
                 positions = np.asarray(calibrate_position_axis(positions), dtype=float)
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] KSpace phase: motor calibration skipped: {e}")
+                print(f"[WARN] Hyperspectral phase: motor calibration skipped: {e}")
 
         # Baseline removal (moving average) + signed-sum centre-burst. When a
         # reference is given it DEFINES the ZPD centre (both cubes share it).

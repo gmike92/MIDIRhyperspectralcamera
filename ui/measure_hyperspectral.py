@@ -1,4 +1,4 @@
-"""Measure tab -- K-space hyperspectral (per-pixel TWINS spectra) + Z-scan.
+"""Measure tab -- hyperspectral (per-pixel TWINS spectra) + Z-scan.
 
 A TWINS wedge scan stores the full 2-D ROI at every position (a datacube), then
 HyperspectralProcessor runs an independent DFT per pixel -> a spectrum cube
@@ -92,7 +92,7 @@ def _get_cmap(name):
 class HyperViewer(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("K-Space Hyperspectral Viewer")
+        self.setWindowTitle("Hyperspectral Viewer")
         self.resize(900, 520)
         self.wavelengths = None
         self.cubes = []          # list of (n_freq, h, w)  (in-RAM mode)
@@ -455,8 +455,8 @@ class LiveInterferogram(QWidget):
         self.curve.setData(self._x, self._y)
 
 
-def load_kspace_npz(path: str):
-    """Read a saved K-space .npz -> (wavelengths, cubes, z_values, sat_masks).
+def load_hyperspectral_npz(path: str):
+    """Read a saved hyperspectral .npz -> (wavelengths, cubes, z_values, sat_masks).
 
     Works for files saved by MeasurePanel (spectral cube, optional saturation
     masks and raw interferogram). Returns None if the spectral cube is absent.
@@ -474,8 +474,8 @@ def load_kspace_npz(path: str):
     return wl, cubes, z_values, masks
 
 
-def kspace_metadata(path: str) -> dict:
-    """The embedded metadata dict of a saved K-space .npz (or {}). Lets a viewer
+def hyperspectral_metadata(path: str) -> dict:
+    """The embedded metadata dict of a saved hyperspectral .npz (or {}). Lets a viewer
     show whether the spectra were computed on the calibrated wedge axis."""
     try:
         with np.load(path, allow_pickle=True) as d:
@@ -497,7 +497,7 @@ class MeasurePanel(QWidget):
 
     def __init__(self, stages_panel, frame_source, roi_provider,
                  roi_show=None, bg_provider=None, save_dir_provider=None,
-                 meta_provider=None, save_dir: str = r"D:\CAMERA\kspace") -> None:
+                 meta_provider=None, save_dir: str = r"D:\CAMERA\hyperspectral") -> None:
         super().__init__()
         self.sp = stages_panel
         self.frame_source = frame_source
@@ -549,7 +549,8 @@ class MeasurePanel(QWidget):
         # Persist scan/spectrum params (incl. the wavelength window) between
         # measurements. Restore first, THEN bind saves so restoring doesn't
         # immediately rewrite the same values.
-        self._settings = QtCore.QSettings("MIR_CAMERA", "KSpace")
+        self._settings = QtCore.QSettings("MIR_CAMERA", "Hyperspectral")
+        self._migrate_legacy_settings()
         self._restore_settings()
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
@@ -931,7 +932,7 @@ class MeasurePanel(QWidget):
                                       "apodization, λ, denoise) -- no re-scan.")
         self.btn_view = QPushButton("Open Viewer"); self.btn_view.clicked.connect(self._open_viewer)
         self.btn_load = QPushButton("Load"); self.btn_load.clicked.connect(self._load)
-        self.btn_load.setToolTip("Open a saved K-space .npz in the viewer.")
+        self.btn_load.setToolTip("Open a saved hyperspectral .npz in the viewer.")
         self.btn_save = QPushButton("Save"); self.btn_save.clicked.connect(self._save)
         row2.addWidget(self.btn_recompute); row2.addWidget(self.btn_view)
         row2.addWidget(self.btn_load); row2.addWidget(self.btn_save)
@@ -948,7 +949,7 @@ class MeasurePanel(QWidget):
         row3.addWidget(QLabel("Save as")); row3.addWidget(self.combo_save, 1)
         v.addLayout(row3)
         row4 = QHBoxLayout()
-        self.edit_filename = QLineEdit("kspace")
+        self.edit_filename = QLineEdit("hyperspectral")
         self.edit_filename.setToolTip("Base filename; files are saved as "
                                       "<date>.<filename> in the camera's save folder.")
         row4.addWidget(QLabel("Filename")); row4.addWidget(self.edit_filename, 1)
@@ -1028,6 +1029,22 @@ class MeasurePanel(QWidget):
         for i, ar in enumerate(self.angle_rows):
             checks[f"ks_azone{i}_on"] = ar["chk"]
         return checks
+
+    def _migrate_legacy_settings(self) -> None:
+        """Carry the tuned scan parameters over from the pre-rename store
+        ("KSpace"), once, so renaming the panel does not reset them."""
+        if self._settings.allKeys():
+            return
+        legacy = QtCore.QSettings("MIR_CAMERA", "KSpace")
+        keys = legacy.allKeys()
+        if not keys:
+            return
+        for key in keys:
+            # the old default base filename is renamed too -- let the new one win
+            if key == "ks_filename" and str(legacy.value(key)).strip() == "kspace":
+                continue
+            self._settings.setValue(key, legacy.value(key))
+        self._settings.sync()
 
     def _restore_settings(self) -> None:
         for key, (widget, cast) in self._persisted_spins().items():
@@ -1229,7 +1246,7 @@ class MeasurePanel(QWidget):
             svd_denoise=params["svd_on"], svd_k=params["svd_k"],
             ft_region=params["ft_region"], ft_width_mm=params["ft_width"],
             apod_center=params["center_method"],
-            zscan=zscan, filename=self.edit_filename.text().strip() or "kspace",
+            zscan=zscan, filename=self.edit_filename.text().strip() or "hyperspectral",
             z_n_positions=len(z_targets), z_positions_mm=list(z_targets),
             z_zones=[dict(start_mm=zr["z0"].value(), stop_mm=zr["z1"].value(),
                           step_um=zr["step"].value())
@@ -1274,7 +1291,7 @@ class MeasurePanel(QWidget):
                     f"acquisition cancelled -- only {free_gb:.1f} GB free (need ~{est_gb:.1f} GB)")
                 return
         self._low_disk_warned = False   # mid-scan low-disk warning fires once per run
-        self._save_fname = self.edit_filename.text().strip() or "kspace"
+        self._save_fname = self.edit_filename.text().strip() or "hyperspectral"
         self._run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_folder = os.path.join(camera_folder, f"{self._run_stamp}.{self._save_fname}")
         self._save_folder = self._run_folder   # per-position saves go here
@@ -1437,7 +1454,7 @@ class MeasurePanel(QWidget):
         (~90 s vs ~2 s to write). Disk headroom is guarded by the low-disk checks
         in _start / the acquire loop instead."""
         folder = getattr(self, "_save_folder", None) or self.save_dir
-        fname = getattr(self, "_save_fname", None) or "kspace"
+        fname = getattr(self, "_save_fname", None) or "hyperspectral"
         os.makedirs(folder, exist_ok=True)
         stamp = getattr(self, "_run_stamp", None) or datetime.now().strftime("%Y%m%d_%H%M%S")
         # Filename tag: include whichever axes were scanned so grid points are
@@ -1734,7 +1751,7 @@ class MeasurePanel(QWidget):
         fresh run folder if there is no active scan (e.g. a manual save after Load)."""
         folder = getattr(self, "_run_folder", None)
         stamp = getattr(self, "_run_stamp", None)
-        fname = getattr(self, "_save_fname", None) or self.edit_filename.text().strip() or "kspace"
+        fname = getattr(self, "_save_fname", None) or self.edit_filename.text().strip() or "hyperspectral"
         if not folder or not stamp:
             base = (self.save_dir_provider() if self.save_dir_provider else None) or self.save_dir
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1883,11 +1900,11 @@ class MeasurePanel(QWidget):
                   else None) or self.save_dir
         start = folder if os.path.isdir(folder) else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load K-space measurement", start, "NumPy archive (*.npz)")
+            self, "Load hyperspectral measurement", start, "NumPy archive (*.npz)")
         if not path:
             return
         try:
-            res = load_kspace_npz(path)
+            res = load_hyperspectral_npz(path)
             if res is None:
                 self.lbl_status.setText("file has no spectral cube")
                 return

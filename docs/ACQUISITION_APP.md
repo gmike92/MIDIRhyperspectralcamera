@@ -26,7 +26,7 @@ MainWindow (ui/main_window.py)  ── QTimer 8 ms poll → self.latest_frame (f
    ├── Camera tab      (exposure, NUC, ROI, colormap, background capture, save image)
    ├── Thorlabs tab    (StagesPanel.delay_group)
    ├── TWINS tab       (StagesPanel.twins_group  +  TwinsScanPanel: live 1-D scan)
-   └── Measure tab     (MeasurePanel: the K-space HYPERSPECTRAL experiment)
+   └── Measure tab     (MeasurePanel: the hyperspectral experiment)
                           frame_source = lambda: self.latest_frame
                           bg_provider, save_dir_provider, meta_provider, roi_provider
 ```
@@ -128,7 +128,7 @@ display range are display-only (don't touch the camera).
 - **Save**: `save_dir_edit` (default `D:\CAMERA`) + `filename_edit`. `save_dir_provider`
   and the camera's "Save image" (TIFF uint16 + NPY + colormapped PNG, stamped
   `YYYYMMDD_HHMMSS.<name>`).
-- **Metadata**: `meta_provider = self._kspace_metadata` returns
+- **Metadata**: `meta_provider = self._hyperspectral_metadata` returns
   `{camera_serial, exposure_ms, averaging, fpa_temp_k, board_temp_c, nuc_corrected,
   save_filename_camera}` from `self.latest_status` — embedded in saved hypercubes.
 - **Status**: `_apply_status` stores `self.latest_status` and updates labels (temps shown
@@ -175,12 +175,12 @@ The **TWINS tab** does a quick scalar interferogram for alignment / single-spect
 
 ---
 
-## 6. The hyperspectral experiment — `MeasurePanel` (`ui/measure_kspace.py`)
+## 6. The hyperspectral experiment — `MeasurePanel` (`ui/measure_hyperspectral.py`)
 
 This is the scientific core. It runs a worker thread that drives the TWINS wedge (and
 optionally the Thorlabs Z stage), grabs frame stacks, computes per-pixel spectra, and
 auto-saves everything. Key classes in the file: `MeasurePanel`, `HyperViewer`,
-`LiveInterferogram`; helpers `load_kspace_npz`, `kspace_metadata`.
+`LiveInterferogram`; helpers `load_hyperspectral_npz`, `hyperspectral_metadata`.
 
 ### Acquisition flow (two-phase worker `_worker`)
 A single **Acquire** = one *run*. At `_start`, a per-run folder
@@ -288,7 +288,7 @@ filename — plus the camera dict from `meta_provider`.
 - **Raw interferogram is always saved** → every file is reprocessable (don't re-add a gate).
 - **Two code trees**: edit `gui/` (canonical). `AnalysisApp/` is the synced analyzer
   distributable; the camera app isn't packaged as an exe (run via `gui/run.bat`).
-- Persistence via `QSettings` orgs "MIR_CAMERA": apps "KSpace"/"TwinsScan"/"HyperViewer".
+- Persistence via `QSettings` orgs "MIR_CAMERA": apps "Hyperspectral"/"TwinsScan"/"HyperViewer".
 
 ---
 
@@ -308,7 +308,7 @@ filename — plus the camera dict from `meta_provider`.
 | `gui/ui/main_window.py` | orchestrator: frame poll, latest_frame, controls, background, save, metadata |
 | `gui/ui/stages.py` | StagesPanel: TWINS + Thorlabs UI, StageController threading, freeze() |
 | `gui/ui/twins_scan.py` | live 1-D TWINS scan UI |
-| `gui/ui/measure_kspace.py` | **MeasurePanel**: the hyperspectral experiment + HyperViewer |
+| `gui/ui/measure_hyperspectral.py` | **MeasurePanel**: the hyperspectral experiment + HyperViewer |
 | `gui/instruments/twins_stage.py` | NIREOS TWINS SCU3D driver |
 | `gui/instruments/stage_driver.py` | Thorlabs KDC101/Z825B driver |
 | `gui/instruments/subtwinslv.py` | TwinsScanner: step-scan engine (`scan`, `scan_cube`) |

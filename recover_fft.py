@@ -1,4 +1,4 @@
-"""recover_fft.py -- finish an interrupted K-space acquisition.
+"""recover_fft.py -- finish an interrupted hyperspectral acquisition.
 
 When an acquisition is stopped during the ACQUIRE phase, its per-position files
 are saved raw-only (`processing_stage="raw_acquired"`: they have the

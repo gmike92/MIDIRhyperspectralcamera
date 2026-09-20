@@ -6,13 +6,6 @@ internal wedge stage (twins_stage.TwinsStage) and, at each position, read a
 scalar from the camera (ROI mean of a frame) to build an interferogram, then
 DFT it into a spectrum using a NIREOS calibration file.
 
-Ported from the LabVIEW pump-probe code (sub_twins_lw.py) but DECOUPLED from
-LabVIEW: instead of triggering Experiment_manager.vi it takes any
-`frame_source` callable returning a 2-D numpy frame -- e.g. our IRC806 camera's
-`get_frame`. The interferogram->spectrum math is the VERBATIM repo
-`SpectrumProcessor` (instruments/spectrum_processor.py, pandas+scipy). Runs a
-simulated scan with no hardware via `simulate=True`.
-
 Usage (with the real camera, later):
     from instruments.twins_stage import TwinsStage
     from instruments.subtwinslv import TwinsScanner

@@ -89,7 +89,7 @@ controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
     main_window.py        orchestrator: live view, controls, background, ROI, save
     stages.py             delay + rotator + TWINS control panels
     twins_scan.py         live 1-D TWINS interferogram scan
-    measure_kspace.py     the hyperspectral experiment + HyperViewer
+    measure_hyperspectral.py  the hyperspectral experiment + HyperViewer
   instruments/          drivers + shared DSP
     stage_driver.py       Thorlabs delay stage (KDC101)
     rotator_stage.py      Thorlabs rotation mount (KDC101, degrees)

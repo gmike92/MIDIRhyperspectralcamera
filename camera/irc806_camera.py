@@ -1,6 +1,6 @@
 """IRC806 (IRCameras "Compact Science Camera") backend via Pleora eBUS.
 
-Implements CameraInterface for the kspace/newcamera GUI. eBUS 5.1.5 has no
+Implements CameraInterface for the hyperspectral camera GUI. eBUS 5.1.5 has no
 SWIG Python binding, so this drives its .NET API (PvDotNet.dll) through
 pythonnet. Frames come back as 16-bit (Mono16). Until IRCameras supplies a
 valid Pleora eBUS license, the image carries the eBUS evaluation watermark
