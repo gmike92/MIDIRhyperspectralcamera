@@ -495,14 +495,12 @@ class MeasurePanel(QWidget):
     sig_point = QtCore.pyqtSignal(float, float, bool)  # pos, ROI-mean, is_first_of_scan
     sig_warn = QtCore.pyqtSignal(str, str)  # (title, message) -> modal warning on the GUI thread
 
-    def __init__(self, stages_panel, frame_source, roi_provider,
-                 roi_show=None, bg_provider=None, save_dir_provider=None,
+    def __init__(self, stages_panel, frame_source,
+                 bg_provider=None, save_dir_provider=None,
                  meta_provider=None, save_dir: str = r"D:\CAMERA\hyperspectral") -> None:
         super().__init__()
         self.sp = stages_panel
         self.frame_source = frame_source
-        self.roi_provider = roi_provider      # () -> (r0,r1,c0,c1) or None (full frame)
-        self.roi_show = roi_show              # (bool) -> toggle the on-image ROI box
         self.bg_provider = bg_provider        # () -> (background_frame|None, subtract_bool)
         self.save_dir_provider = save_dir_provider  # () -> current save folder (camera)
         self.meta_provider = meta_provider    # () -> dict of camera metadata
@@ -534,7 +532,6 @@ class MeasurePanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._build_roi_group())
         layout.addWidget(self._build_scan_group())
         layout.addWidget(self._build_spectrum_group())
         layout.addWidget(self._build_postproc_group())
@@ -569,45 +566,7 @@ class MeasurePanel(QWidget):
         self._update_zstep()
         self._update_astep()
 
-        # Keep the ROI px readout live while the box is dragged.
-        self._roi_timer = QtCore.QTimer(self)
-        self._roi_timer.timeout.connect(self._refresh_roi_label)
-        self._roi_timer.start(700)
-
     # -- groups --------------------------------------------------------------
-    def _build_roi_group(self) -> QGroupBox:
-        g = QGroupBox("ROI + binning")
-        grid = QGridLayout(g)
-        hint = QLabel("Set the ROI on the live view (tick \"Show measurement ROI\" "
-                      "and drag the box). It is saved with the measurement.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(hint, 0, 0, 1, 2)
-
-        self.spin_bin = QSpinBox()
-        self.spin_bin.setRange(1, 64)
-        self.spin_bin.setValue(1)
-        self.spin_bin.setToolTip("Bin NxN pixels into one super-pixel (better SNR, "
-                                 "smaller cube). 1 = no binning.")
-        self.spin_bin.valueChanged.connect(self._refresh_roi_label)
-        grid.addWidget(QLabel("Binning (NxN)"), 1, 0)
-        grid.addWidget(self.spin_bin, 1, 1)
-
-        self.lbl_roi = QLabel("ROI: full frame")
-        self.lbl_roi.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(self.lbl_roi, 2, 0, 1, 2)
-        return g
-
-    def _refresh_roi_label(self) -> None:
-        roi = self.roi_provider() if self.roi_provider else None
-        b = self.spin_bin.value()
-        if roi is None:
-            self.lbl_roi.setText("ROI: full frame")
-        else:
-            r0, r1, c0, c1 = roi
-            h, w = (r1 - r0) // b, (c1 - c0) // b
-            self.lbl_roi.setText(f"ROI: {r1-r0}×{c1-c0} px  →  {h}×{w} after bin {b}")
-
     def _build_scan_group(self) -> QGroupBox:
         g = QGroupBox("TWINS cube scan")
         grid = QGridLayout(g)
@@ -944,7 +903,6 @@ class MeasurePanel(QWidget):
             "ks_stop": (self.spin_stop, float),
             "ks_steps": (self.spin_steps, int),
             "ks_frames": (self.spin_frames, int),
-            "ks_bin": (self.spin_bin, int),
             "ks_wl0": (self.spin_wl0, float),
             "ks_wl1": (self.spin_wl1, float),
             "ks_nfreq": (self.spin_nfreq, int),
@@ -1132,23 +1090,17 @@ class MeasurePanel(QWidget):
         if self.frame_source() is None:
             self.sig_status.emit("No live frame -- start the camera first")
             return
-        roi = self.roi_provider() if self.roi_provider else None   # None = full frame
-        self._scan_roi = roi          # saved with the measurement
-        self._scan_bin = self.spin_bin.value()
-        if roi is not None:
-            r0, r1, c0, c1 = roi
-            self.sig_status.emit(f"ROI saved for scan: rows {r0}-{r1}, cols {c0}-{c1}")
-
         # Snapshot the captured background (full frame) + whether to subtract it,
         # taken now so it can't change mid-scan.
         bg, bg_sub = self.bg_provider() if self.bg_provider else (None, False)
         bg = None if bg is None else np.asarray(bg, dtype=np.float32)
-        if roi is not None and bg is not None:
-            self.sig_status.emit("background " + ("subtracted" if bg_sub else "saved (not subtracted)"))
+        # Camera state (exposure, binning, hardware ROI, temperatures) read once,
+        # now, so it cannot change mid-scan.
+        self._cam_meta = (self.meta_provider() or {}) if self.meta_provider else {}
+
         params = dict(
             start=self.spin_start.value(), stop=self.spin_stop.value(),
-            n=self.spin_steps.value(), frames=self.spin_frames.value(), roi=roi,
-            bin=self.spin_bin.value(),
+            n=self.spin_steps.value(), frames=self.spin_frames.value(),
             apod_type=self.combo_apod.currentText(),
             wl0=self.spin_wl0.value(),
             wl1=self.spin_wl1.value(), nfreq=self.spin_nfreq.value(),
@@ -1165,8 +1117,11 @@ class MeasurePanel(QWidget):
                    if nsteps > 1 else None)
         self._scan_meta = dict(
             start_mm=params["start"], stop_mm=params["stop"], n_steps=nsteps,
-            step_um=step_um, frames_per_point=params["frames"], binning=params["bin"],
-            roi=list(roi) if roi is not None else None,
+            step_um=step_um, frames_per_point=params["frames"],
+            # The binning is done by the CAMERA (camera panel) and sets the cube
+            # geometry -- lifted out of the camera dict so readers find it at the
+            # top level, where this panel's own software binning used to be.
+            binning=self._cam_meta.get("binning"),
             apodization=params["apod_type"],
             wl_start_um=params["wl0"], wl_stop_um=params["wl1"],
             n_freq_setting=params["nfreq"], expected_zpd_mm=DEFAULT_ZPD_MM,
@@ -1191,14 +1146,10 @@ class MeasurePanel(QWidget):
         # --- Disk-space check: estimate the data size and warn if the save volume
         # is low (do this BEFORE freezing the UI / starting the thread). ---
         frame = self.frame_source()
-        if roi is not None:
-            hh, ww = roi[1] - roi[0], roi[3] - roi[2]
-        elif frame is not None:
-            hh, ww = int(frame.shape[0]), int(frame.shape[1])
+        if frame is not None:
+            hb, wb = int(frame.shape[0]), int(frame.shape[1])
         else:
-            hh = ww = 0
-        binf = max(1, params["bin"])
-        hb, wb = max(1, hh // binf), max(1, ww // binf)
+            hb = wb = 0
         n_freq_est = resolve_n_points(params["n"], manual=params["nfreq"])
         grid_total = ((len(z_targets) if zscan else 1) * (len(a_targets) if ascan else 1))
         # per cube = raw (n_pos planes) + spectrum (n_freq planes), float32. Files
@@ -1223,7 +1174,6 @@ class MeasurePanel(QWidget):
         self._run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_folder = os.path.join(camera_folder, f"{self._run_stamp}.{self._save_fname}")
         self._save_folder = self._run_folder   # per-position saves go here
-        self._cam_meta = (self.meta_provider() or {}) if self.meta_provider else {}
         self._save_raw_flag = self.chk_save_raw.isChecked()
         self._per_position_saved = False
         self._abort = False
@@ -1440,22 +1390,17 @@ class MeasurePanel(QWidget):
     def _worker(self, p: dict) -> None:
         try:
             from instruments.analysis import saturation_mask
-            from instruments.subtwinslv import bin_image
             scanner = TwinsScanner(self.sp.twins, self.frame_source)
             proc = HyperspectralProcessor()
             cubes, zvals, masks, wls = [], [], [], None
             raw_cubes, raw_positions = [], []
-            # Background: subtract from each frame (if enabled) and record the
-            # binned-ROI background in the cube geometry for saving.
+            # Background: subtract from each frame (if enabled) and record it
+            # in the cube geometry (= the delivered frame) for saving.
             bg = p["background"]
             bg_for_scan = bg if p["bg_subtract"] else None
             self.background_subtracted = bool(p["bg_subtract"] and bg is not None)
-            if bg is not None:
-                _roi = p["roi"]
-                _crop = bg if _roi is None else bg[_roi[0]:_roi[1], _roi[2]:_roi[3]]
-                self.background_map = bin_image(np.asarray(_crop, dtype=np.float32), p["bin"])
-            else:
-                self.background_map = None
+            self.background_map = (None if bg is None
+                                   else np.asarray(bg, dtype=np.float32))
             # Scan axes. [None] means "that axis is not scanned" -> a single
             # position. The full acquisition is the NESTED grid: outer Z, inner
             # angle (for each Z, sweep every angle).
@@ -1511,8 +1456,8 @@ class MeasurePanel(QWidget):
                         self.sig_point.emit(float(pos), float(value), i == 1)
 
                     positions, datacube = scanner.scan_cube(
-                        p["start"], p["stop"], p["n"], p["roi"],
-                        frames_avg=p["frames"], bin_factor=p["bin"], background=bg_for_scan,
+                        p["start"], p["stop"], p["n"], None,
+                        frames_avg=p["frames"], background=bg_for_scan,
                         progress=prog, should_abort=lambda: self._abort,
                         status_cb=lambda m: self.sig_status.emit(m))
 
@@ -1751,15 +1696,12 @@ class MeasurePanel(QWidget):
         return meta
 
     def _save_cube_npz(self, stem: str) -> str:
-        roi = getattr(self, "_scan_roi", None)
         meta = self._build_metadata()
         kw = dict(
             wavelengths=self.wavelengths,
             spectrum_cubes=np.asarray(self.cubes),
             z_values=np.asarray([np.nan if z is None else z for z in self.z_values]),
             z_unit="mm",
-            roi=np.asarray(roi if roi is not None else [], dtype=float),
-            binning=int(getattr(self, "_scan_bin", 1)),
             metadata=np.array(meta, dtype=object),          # dict (load allow_pickle=True)
             metadata_json=json.dumps(meta, default=str, indent=2))  # portable, human-readable
         masks = getattr(self, "sat_masks", None)
@@ -1768,8 +1710,8 @@ class MeasurePanel(QWidget):
             kw["saturation_masks"] = np.array([
                 (np.zeros((h, w), bool) if m is None else np.asarray(m, bool))
                 for m in masks])
-        # The captured background (binned-ROI geometry, aligns with the cube) +
-        # whether it was subtracted from the interferogram.
+        # The captured background (same geometry as the cube) + whether it was
+        # subtracted from the interferogram.
         if getattr(self, "background_map", None) is not None:
             kw["background"] = np.asarray(self.background_map)
             kw["background_subtracted"] = bool(self.background_subtracted)

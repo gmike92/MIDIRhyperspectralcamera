@@ -121,8 +121,10 @@ Connect → `connect`; NUC checkbox → `set_correction`; BPR → `set_bpr`; NUC
 display range are display-only (don't touch the camera).
 
 ### ROI, background, save, metadata, status (the callbacks MeasurePanel depends on)
-- **ROI**: a draggable cyan box on the image; `get_roi_bounds()` → `(r0,r1,c0,c1)` clipped,
-  or `None` (full frame). Passed as `roi_provider`.
+- **ROI**: a draggable cyan box on the image, applied to the CAMERA as a hardware
+  subarray ("Apply ROI"). `get_measurement_roi()` always returns `None` (no software
+  crop) and is passed as `roi_provider` to the TWINS scan panel only — the Measure
+  panel processes the whole delivered frame.
 - **Background**: "Capture" averages `bg_average_frames` (16) into `self.background_frame`
   (float32). `bg_provider = lambda: (self.background_frame, self.use_bg_subtraction)`.
 - **Save**: `save_dir_edit` (default `D:\CAMERA`) + `filename_edit`. `save_dir_provider`
@@ -190,7 +192,8 @@ captured once; `_run_target()` returns `(folder, stamp, fname)`). Z targets =
 
 - **Phase 1 — ACQUIRE every Z position back-to-back (NO FFT between steps).**
   For each Z: move the Thorlabs stage → `TwinsScanner.scan_cube(...)` returns
-  `(positions, datacube)` where `datacube` is `(n_pos, h, w)` over the **binned ROI**.
+  `(positions, datacube)` where `datacube` is `(n_pos, h, w)` over the **delivered
+  frame** (the camera panel's ROI + binning set that geometry).
   Each step is **immediately safety-saved** raw-only & **uncompressed**
   (`_save_position_npz(..., compress=False)`, metadata `processing_stage="raw_acquired"`),
   so a later crash never loses acquired data.
@@ -202,8 +205,9 @@ captured once; `_run_target()` returns `(folder, stamp, fname)`). Z targets =
 
 `scan_cube` (`subtwinslv.py`): per step, `wait_for_stop` + settle, then `_read_roi_slice`
 averages **distinct** frames (object-identity, drop first in-flight), subtracts the
-captured **background** (full-frame, before ROI crop+bin) if enabled, crops to ROI, bins by
-`bin_factor`. Records the **real measured** wedge position (`stage.get_position()`). On a
+captured **background** if enabled. Its `roi` / `bin_factor` arguments still exist for the
+TWINS tab; the Measure panel passes neither. Records the **real measured** wedge position
+(`stage.get_position()`). On a
 camera freeze it `_wait_for_stream` then re-acquires that step. `progress(i,tot,pos,value)`
 drives the live interferogram preview.
 
@@ -219,7 +223,7 @@ drives the live interferogram preview.
   avoid **double-calibration** (feeds the calibrated axis with `positions_calibrated=True`).
 
 ### The per-pixel transform (`instruments/hyperspectral.py::compute_hyperspectral`)
-- Operates on the **ROI (binned) cube only** — the full frame is never transformed.
+- Operates on the delivered-frame cube — whatever the camera ROI + binning produce.
 - Preprocess: moving-average baseline removal; `find_centerburst` (signed spatial sum →
   Hilbert envelope, searched ±`search_mm` around `expected_zero_mm=24.33`); optional
   symmetrize. Apodization via `dsp.apodization_window` — now **asymmetric-aware** (per-wing
@@ -249,7 +253,8 @@ and a calibration badge via `set_calibration_note(meta)`. `set_result` (in-RAM) 
 `set_result_lazy` (per-Z lazy load). The big **analysis** app is separate (`analysis_app.py`).
 
 ### Metadata captured at scan start (`_scan_meta` + `_cam_meta`)
-start/stop/steps/step_um, frames/point, binning, ROI, apodization+width, wl range,
+start/stop/steps/step_um, frames/point, camera `binning` (read from the camera
+status at scan start, top level), apodization+width, wl range,
 n_freq setting, ZPD, background_subtracted, saturation level, zscan,
 filename — plus the camera dict from `meta_provider`.
 
@@ -279,8 +284,8 @@ filename — plus the camera dict from `meta_provider`.
   background back if it was subtracted).
 - **TWINS `wait_for_stop`** must really wait (the `STATUS_MOVING=6` bug recorded during motion).
 - **Exposure clamp 0.01–8 ms** is mandatory (firmware min/max are invalid; >8 ms freezes).
-- **The DFT is ROI+binned only** — to speed up: tighter ROI, higher bin, fewer `n_freq`, or a
-  `complex64` kernel (~2×; currently complex128).
+- **The DFT runs on the whole delivered frame** — to speed up: a tighter camera ROI, higher
+  camera binning, fewer `n_freq`, or a `complex64` kernel (~2×; currently complex128).
 - **Calibrated axis is applied at compute time, never double-applied on reload** (metadata flag
   + `positions_calibrated`). Raw axis is preserved so files can be re-derived with a new cal.
 - **Raw interferogram is always saved** → every file is reprocessable (don't re-add a gate).

@@ -115,8 +115,6 @@ class MainWindow(QMainWindow):
         self.measure_panel = MeasurePanel(
             self.stages_panel,
             frame_source=lambda: self.latest_frame,
-            roi_provider=self.get_measurement_roi,
-            roi_show=self.set_roi_visible,
             bg_provider=lambda: (self.background_frame, self.use_bg_subtraction),
             # Save hyperspectral files into the SAME folder set in the camera Save group.
             save_dir_provider=lambda: self.save_dir_edit.text().strip() or self.save_dir,
@@ -708,9 +706,9 @@ class MainWindow(QMainWindow):
                 f"Box: rows {r0}-{r1}, cols {c0}-{c1}  ({c1-c0}×{r1-r0} px) — Apply to set")
 
     def get_measurement_roi(self):
-        """The hyperspectral measurement processes the WHOLE delivered frame:
-        the camera hardware ROI already restricts the field of view, so there is
-        no separate software crop. Always None (= full delivered frame)."""
+        """The measurement panels process the WHOLE delivered frame: the camera
+        hardware ROI already restricts the field of view, so there is no separate
+        software crop. Always None (= full delivered frame)."""
         return None
 
     def _roi_box_bounds(self):

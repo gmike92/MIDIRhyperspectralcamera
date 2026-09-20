@@ -52,7 +52,7 @@ controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
 - Live image with Inferno / Viridis / Magma / Grey / Turbo / Coolwarm colormaps.
 - Auto or fixed Min/Max colorbar; click a pixel for horizontal/vertical profiles.
 - Integration time 0.01–8 ms, averaging, background capture/subtraction, snapshot.
-- On-image draggable **ROI** + binning, shared by the measurement panels.
+- On-image draggable **ROI** applied as the camera subarray, plus N×N camera binning.
 - FPGA/board + FPA temperature readout (serial-over-GigE), NUC/BPR correction.
 
 **Stages**
