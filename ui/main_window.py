@@ -8,15 +8,12 @@ from multiprocessing import shared_memory
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QRect, QSize
-from PyQt6.QtGui import QPainter, QPdfWriter
-from PyQt6.QtSvg import QSvgGenerator
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -110,7 +107,6 @@ class MainWindow(QMainWindow):
             self._build_processing_group(),
             self._build_correction_group(),
             self._build_save_group(),
-            self._build_measurements_group(),
         ]), "Camera")
         controls_tabs.addTab(
             self._make_tab([self.stages_panel.delay_group]), "Thorlabs Stage")
@@ -440,6 +436,28 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Camera")
         layout = QVBoxLayout(group)
 
+        # Camera / streaming controls at the TOP of the panel.
+        connect_button = QPushButton("Connect / Reconnect")
+        connect_button.clicked.connect(self.connect_selected_mode)
+        disconnect_button = QPushButton("Disconnect")
+        disconnect_button.setToolTip(
+            "Stop the stream and release the camera, staying offline (no "
+            "auto-reconnect). Use this if the image splits / shows wrong pixels "
+            "(GigE stream desync), then click Connect / Reconnect to recover.")
+        disconnect_button.clicked.connect(self.disconnect_camera)
+        start_button = QPushButton("Start")
+        start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
+        pause_button = QPushButton("Pause")
+        pause_button.clicked.connect(lambda: self.control_queue.put({"type": "pause"}))
+        top_buttons = QHBoxLayout()
+        top_buttons.addWidget(connect_button)
+        top_buttons.addWidget(disconnect_button)
+        bottom_buttons = QHBoxLayout()
+        bottom_buttons.addWidget(start_button)
+        bottom_buttons.addWidget(pause_button)
+        layout.addLayout(top_buttons)
+        layout.addLayout(bottom_buttons)
+
         self.backend_label = QLabel("Backend: unknown")
         self.mode_label = QLabel("Requested mode: -")
         self.resolution_label = QLabel("Resolution: -")
@@ -451,7 +469,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(_w)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["irc806", "ophir", "mock", "auto"])
+        self.mode_combo.addItems(["irc806", "ophir", "mock"])
         self.mode_combo.setCurrentText(self.current_mode)
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)
@@ -521,30 +539,6 @@ class MainWindow(QMainWindow):
             fr_row.addWidget(self.framerate_spin)
             layout.addLayout(fr_row)
 
-        start_button = QPushButton("Start")
-        start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
-        pause_button = QPushButton("Pause")
-        pause_button.clicked.connect(lambda: self.control_queue.put({"type": "pause"}))
-        snapshot_button = QPushButton("Snapshot")
-        snapshot_button.clicked.connect(lambda: self.control_queue.put({"type": "snapshot"}))
-        connect_button = QPushButton("Connect / Reconnect")
-        connect_button.clicked.connect(self.connect_selected_mode)
-        disconnect_button = QPushButton("Disconnect")
-        disconnect_button.setToolTip(
-            "Stop the stream and release the camera, staying offline (no "
-            "auto-reconnect). Use this if the image splits / shows wrong pixels "
-            "(GigE stream desync), then click Connect / Reconnect to recover.")
-        disconnect_button.clicked.connect(self.disconnect_camera)
-        top_buttons = QHBoxLayout()
-        top_buttons.addWidget(connect_button)
-        top_buttons.addWidget(start_button)
-        bottom_buttons = QHBoxLayout()
-        bottom_buttons.addWidget(disconnect_button)
-        bottom_buttons.addWidget(pause_button)
-        bottom_buttons.addWidget(snapshot_button)
-        layout.addLayout(top_buttons)
-        layout.addLayout(bottom_buttons)
-
         return group
 
     def _build_processing_group(self) -> QGroupBox:
@@ -611,14 +605,6 @@ class MainWindow(QMainWindow):
         # initial enabled state matches auto toggle (auto starts off -> manual on)
         self.display_min_spin.setEnabled(not self.auto_scale_display)
         self.display_max_spin.setEnabled(not self.auto_scale_display)
-
-        save_svg_button = QPushButton("Save snapshot as SVG")
-        save_svg_button.clicked.connect(self.save_snapshot_svg)
-        layout.addWidget(save_svg_button)
-
-        save_pdf_button = QPushButton("Save snapshot as PDF")
-        save_pdf_button.clicked.connect(self.save_snapshot_pdf)
-        layout.addWidget(save_pdf_button)
 
         return group
 
@@ -764,25 +750,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(msg, 4000)
         else:
             self.save_status_label.setText("Save FAILED (see console)")
-
-    def _build_measurements_group(self) -> QGroupBox:
-        group = QGroupBox("Measurements")
-        layout = QFormLayout(group)
-
-        self.measurement_labels = {}
-        for key in (
-            "peak",
-            "total_power",
-            "centroid_x",
-            "centroid_y",
-            "beam_width_x",
-            "beam_width_y",
-        ):
-            label = QLabel("-")
-            layout.addRow(key.replace("_", " ").title(), label)
-            self.measurement_labels[key] = label
-
-        return group
 
     def _ms_to_slider(self, ms: float) -> int:
         ms = float(np.clip(ms, self.INT_MIN_MS, self.INT_MAX_MS))
@@ -1011,83 +978,6 @@ class MainWindow(QMainWindow):
         self.image_item.setColorMap(self.color_map)
         self.color_bar.setColorMap(self.color_map)
 
-    def _compute_measurements(self, frame: np.ndarray) -> dict[str, float]:
-        weights = np.clip(frame.astype(np.float64), 0.0, None)
-        total_power = float(weights.sum())
-        peak = float(np.nanmax(frame)) if frame.size else 0.0
-
-        if total_power <= 0:
-            return {
-                "peak": peak,
-                "total_power": 0.0,
-                "centroid_x": 0.0,
-                "centroid_y": 0.0,
-                "beam_width_x": 0.0,
-                "beam_width_y": 0.0,
-            }
-
-        yy, xx = np.indices(frame.shape, dtype=np.float64)
-        centroid_x = float((weights * xx).sum() / total_power)
-        centroid_y = float((weights * yy).sum() / total_power)
-        var_x = float((weights * (xx - centroid_x) ** 2).sum() / total_power)
-        var_y = float((weights * (yy - centroid_y) ** 2).sum() / total_power)
-
-        return {
-            "peak": peak,
-            "total_power": total_power,
-            "centroid_x": centroid_x,
-            "centroid_y": centroid_y,
-            "beam_width_x": 2.0 * np.sqrt(max(var_x, 0.0)),
-            "beam_width_y": 2.0 * np.sqrt(max(var_y, 0.0)),
-        }
-
-    def _render_export_panel(self, painter: QPainter) -> None:
-        self.export_panel.render(painter)
-
-    def save_snapshot_svg(self) -> None:
-        if self.latest_frame is None:
-            QMessageBox.information(self, "No data", "No frame is available yet.")
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save SVG Snapshot",
-            "wincam_snapshot.svg",
-            "SVG files (*.svg)",
-        )
-        if not path:
-            return
-
-        generator = QSvgGenerator()
-        generator.setFileName(path)
-        size = self.export_panel.size()
-        generator.setSize(QSize(max(size.width(), 1), max(size.height(), 1)))
-        generator.setViewBox(QRect(0, 0, max(size.width(), 1), max(size.height(), 1)))
-        generator.setTitle("WinCamD snapshot")
-        painter = QPainter(generator)
-        self._render_export_panel(painter)
-        painter.end()
-
-    def save_snapshot_pdf(self) -> None:
-        if self.latest_frame is None:
-            QMessageBox.information(self, "No data", "No frame is available yet.")
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save PDF Snapshot",
-            "wincam_snapshot.pdf",
-            "PDF files (*.pdf)",
-        )
-        if not path:
-            return
-
-        writer = QPdfWriter(path)
-        writer.setResolution(300)
-        painter = QPainter(writer)
-        self._render_export_panel(painter)
-        painter.end()
-
     def update_from_worker(self) -> None:
         latest_frame_packet = None
         try:
@@ -1228,16 +1118,6 @@ class MainWindow(QMainWindow):
                 pass
             self._update_crosshair()
             self._update_profiles(display_frame)
-
-            processed_measurement = self._compute_measurements(display_frame)
-            for key, label in self.measurement_labels.items():
-                value = processed_measurement.get(key, 0.0)
-                if key in {"centroid_x", "centroid_y", "beam_width_x", "beam_width_y"}:
-                    label.setText(f"{value:.2f} px")
-                elif key == "total_power":
-                    label.setText(f"{value:.0f}")
-                else:
-                    label.setText(f"{value:.1f}")
 
         self.frame_count += 1
         now = time.time()
