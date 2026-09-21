@@ -40,14 +40,6 @@ from instruments import analysis as A
 from instruments.hyperspectral import (
     HyperspectralProcessor, resolve_n_points, DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM)
 
-# Stokes polarimetry panel (embedded as a toolbar-toggled page). Guarded so the
-# analyzer still starts if stokes_app.py is ever absent -- the Stokes button is
-# just omitted in that case.
-try:
-    from stokes_app import StokesApp
-except Exception:  # noqa: BLE001
-    StokesApp = None
-
 
 # ---------------------------------------------------------------------------
 # File helpers (read metadata cheaply; load cube on demand)
@@ -355,7 +347,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.phase_mode = False        # True while the phase-only page is shown
         self.phase_bkg = None          # (ref_raw_cube, ref_positions, path) background
         self.phase_bkg_on = False      # subtract the background phase (per-pixel)
-        self._stokes_dirty = True      # Stokes panel needs (re)fill from loaded folder
         self.work_roi = None           # pg.RectROI defining the analysis crop (or None)
         self._full_hw = None           # (h, w) of the FULL current frame (pre-crop)
 
@@ -370,17 +361,17 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     # -- UI -------------------------------------------------------------------
     def _build_ui(self):
-        # toolbar: exactly six controls -- Load folder | Load files | [view
-        # selector: Hypercube · Phase · Stokes] | Save/Export dropdown.
+        # toolbar: Load folder | Load files | [view selector: Hypercube · Phase]
+        # | Save/Export dropdown.
         tb = self.addToolBar("File")
         tb.setMovable(False)
         tb.addAction("Load folder…").triggered.connect(self.load_folder)
         tb.addAction("Load files…").triggered.connect(self.load_files)
         tb.addSeparator()
 
-        # View selector: three mutually-exclusive toggles picking the central page.
+        # View selector: two mutually-exclusive toggles picking the central page.
         # Exactly one is always active, so "Hypercube" is the always-available way
-        # back from the Phase / Stokes views.
+        # back from the Phase view.
         self.view_group = QtGui.QActionGroup(self)
         self.view_group.setExclusive(True)
         self.act_hyper = tb.addAction("Hypercube")
@@ -396,14 +387,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                                   "(recomputed complex DFT at the current λ).")
         self.act_phase.toggled.connect(self._toggle_phase_view)
         self.view_group.addAction(self.act_phase)
-        self.act_stokes = None
-        if StokesApp is not None:
-            self.act_stokes = tb.addAction("Stokes")
-            self.act_stokes.setCheckable(True)
-            self.act_stokes.setToolTip("Stokes polarimetry: compute S0..S3 per "
-                                       "pixel from four QWP-angle measurements.")
-            self.act_stokes.toggled.connect(self._toggle_stokes_view)
-            self.view_group.addAction(self.act_stokes)
         tb.addSeparator()
 
         # Save / Export dropdown: all saving + export actions in one menu button.
@@ -714,11 +697,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             "Recompute map/spectra from the interferogram window (below)")
         self.chk_recompute.toggled.connect(self._toggle_recompute)
         ig.addWidget(self.chk_recompute)
-        pb = QtWidgets.QHBoxLayout()
-        for name, fn in [("Full", self._win_full), ("Centre", self._win_centre),
-                         ("Left tail", self._win_left), ("Right tail", self._win_right)]:
-            b = QtWidgets.QPushButton(name); b.clicked.connect(fn); pb.addWidget(b)
-        ig.addLayout(pb)
         form = QtWidgets.QFormLayout()
         self.r_apod = QtWidgets.QComboBox()
         # SYMMETRIC FTIR windows centred at the ZPD (no width parameter).
@@ -895,11 +873,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.main_split)   # index 0
         self.stack.addWidget(self.phase_page)   # index 1
-        # Stokes page: embed the standalone StokesApp (its own self-contained UI
-        # + file loading), so the panel behaves exactly like stokes_app.py.
-        self.stokes_app = StokesApp(embedded=True) if StokesApp is not None else None
-        if self.stokes_app is not None:
-            self.stack.addWidget(self.stokes_app)   # index 2
         self.setCentralWidget(self.stack)
 
         self.statusBar().showMessage("No data — File ▸ Load folder…")
@@ -1003,12 +976,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             if len(self._a_axis) > 1:
                 zr += f", {len(self._a_axis)} angles {self._a_axis[0]:.1f}…{self._a_axis[-1]:.1f}°"
             self.statusBar().showMessage(f"Loaded {len(infos)} cube(s): {zr}")
-            # A new dataset -> the Stokes panel must refill from it (lazily on next
-            # open, or right away if it is the page currently shown).
-            self._stokes_dirty = True
-            if (self.stokes_app is not None
-                    and self.stack.currentWidget() is self.stokes_app):
-                self._refresh_stokes_from_main()
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -1547,36 +1514,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 "This file has no stored raw interferogram — it cannot be recomputed "
                 "(re-acquire with raw saved).", 5000)
 
-    def _zpd_mm(self, pos, raw):
-        from instruments.hyperspectral import find_centerburst
-        ifg = raw.mean(axis=(1, 2))
-        idx = find_centerburst(ifg - ifg.mean(), pos, DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM)
-        return float(pos[idx])
-
-    def _set_window(self, lo, hi):
-        self.win_region.setRegion([float(lo), float(hi)])
-        self._on_window_changed()
-
-    def _win_full(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            self._set_window(pos.min(), pos.max())
-
-    def _win_centre(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            z = self._zpd_mm(pos, raw); self._set_window(z - 0.2, z + 0.2)
-
-    def _win_left(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            self._set_window(pos.min(), self._zpd_mm(pos, raw) - 0.05)
-
-    def _win_right(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            self._set_window(self._zpd_mm(pos, raw) + 0.05, pos.max())
-
     def current_mask(self):
         zi = self._cur()
         return self.infos[zi]["mask"] if zi is not None else None
@@ -1978,35 +1915,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._mirror_phase_sliders()
             self._update_phase()
 
-    def _toggle_stokes_view(self, on):
-        """Show the embedded Stokes polarimetry page. On entry, (re)fill it from
-        the folder loaded in the analyzer so the user does not pick a folder
-        again."""
-        if on and self._stokes_dirty:
-            self._refresh_stokes_from_main()
-        self._show_view()
-
-    def _refresh_stokes_from_main(self):
-        """Feed the Stokes panel the .npz files currently loaded in the analyzer
-        (File ▸ Load folder), so it auto-assigns the four QWP slots by angle."""
-        if self.stokes_app is None:
-            return
-        if not self.infos:
-            self.stokes_app.status.showMessage(
-                "No dataset loaded — use File ▸ Load folder in the analyzer first.")
-            return
-        paths = list(dict.fromkeys(i["path"] for i in self.infos))   # unique, ordered
-        self.stokes_app.populate_from_paths(paths)
-        self._stokes_dirty = False
-
     def _show_view(self):
         """Pick the central page from the view toggles (Hypercube = main view)."""
         if getattr(self, "stack", None) is None:
             return                                  # toolbar built before the stack
         if self.act_phase.isChecked():
             self.stack.setCurrentWidget(self.phase_page)
-        elif self.act_stokes is not None and self.act_stokes.isChecked():
-            self.stack.setCurrentWidget(self.stokes_app)
         else:
             self.stack.setCurrentWidget(self.main_split)
 
