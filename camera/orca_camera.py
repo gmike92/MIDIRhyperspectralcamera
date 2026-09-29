@@ -182,7 +182,11 @@ class OrcaCamera(CameraInterface):
 
     # -- settings ------------------------------------------------------------
     def set_exposure(self, exposure_ms: float) -> None:
-        self.exposure_ms = max(float(exposure_ms), 1e-3)
+        # Clamp to the limits DCAM reports for the current ROI / binning; the
+        # camera would clamp anyway, this keeps our cached value honest.
+        self.exposure_ms = float(np.clip(float(exposure_ms),
+                                         self.status.exposure_min_ms,
+                                         self.status.exposure_max_ms))
         self.status.exposure_ms = self.exposure_ms
         if self._cam is not None:
             try:
@@ -270,6 +274,15 @@ class OrcaCamera(CameraInterface):
         try:
             self.status.sensor_width = int(cam.sensor_h)    # wrapper: sensor_h = horizontal
             self.status.sensor_height = int(cam.sensor_v)
+        except Exception:  # noqa: BLE001
+            pass
+        # Exposure limits move with ROI / binning (readout time), so they are
+        # re-read here rather than assumed once at connect.
+        try:
+            rng = cam.get_exposure_range() if hasattr(cam, "get_exposure_range") else None
+            if rng:
+                self.status.exposure_min_ms = float(rng[0]) * 1000.0
+                self.status.exposure_max_ms = float(rng[1]) * 1000.0
         except Exception:  # noqa: BLE001
             pass
         try:

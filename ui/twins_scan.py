@@ -36,7 +36,7 @@ class TwinsScanPanel(QWidget):
     sig_status = QtCore.pyqtSignal(str)
 
     def __init__(self, twins_ctl, frame_source, roi_provider=None,
-                 save_dir: str = r"D:\CAMERA\twins") -> None:
+                 save_dir: str = r"C:\CAMERA\twins") -> None:
         super().__init__()
         self.twins_ctl = twins_ctl              # StageController (has .driver, .run, .busy)
         self.frame_source = frame_source        # () -> 2D frame or None

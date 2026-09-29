@@ -184,6 +184,20 @@ class HamamatsuCamera:
             self.exposure = self.hamamatsu.getExposure()
         return self.exposure
 
+    def get_exposure_range(self) -> tuple[float, float] | None:
+        """(min, max) exposure in SECONDS as DCAM reports it for the current
+        ROI / binning / readout, or None when it can't be read."""
+        if not self._open:
+            return None
+        try:
+            lo, hi = self.hamamatsu.getPropertyRange("exposure_time")
+        except Exception:  # noqa: BLE001
+            return None
+        lo, hi = float(lo), float(hi)
+        if not (lo > 0 and hi > lo):
+            return None
+        return lo, hi
+
     def get_internal_frame_rate(self) -> float:
         """Maximum internal frame rate for the current ROI/exposure."""
         if self._open:
@@ -422,6 +436,9 @@ class MockCamera:
 
     def get_exposure(self) -> float:
         return self._exposure
+
+    def get_exposure_range(self) -> tuple[float, float]:
+        return 1.0e-5, 10.0        # 0.01 ms .. 10 s, a plausible sCMOS span
 
     def get_internal_frame_rate(self) -> float:
         return 1.0 / max(self._exposure, 1e-4)

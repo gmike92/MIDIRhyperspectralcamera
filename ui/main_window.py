@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import queue
 import time
@@ -22,7 +23,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLineEdit,
     QScrollArea,
-    QSlider,
     QTabWidget,
     QSpinBox,
     QVBoxLayout,
@@ -67,7 +67,7 @@ class MainWindow(QMainWindow):
         self.last_display_frame = None
         self._display_levels = (0.0, 65535.0)   # Orca is 16-bit
         self.profile_pixel = None  # (row, col) for X/Y profiles; None = center
-        self.save_dir = r"D:\CAMERA"
+        self.save_dir = r"C:\CAMERA"
         self.save_filename = "filename"
         self.auto_scale_display = False
         self.frame_count = 0
@@ -298,22 +298,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)
 
-        # Exposure time. The Orca sCMOS supports a wide exposure range; the UI
-        # spans 0.01..1000 ms (use the spin box for precise entry). The slider is
-        # in units of 0.01 ms.
-        self.integration_label = QLabel("Exposure time: 10.00 ms")
-        self.integration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.integration_slider.setRange(1, 100000)   # x0.01 ms -> 0.01..1000 ms
-        self.integration_slider.setValue(1000)         # 10.0 ms start
-        self.integration_slider.valueChanged.connect(self.on_integration_slider_changed)
+        # Exposure time. The range below is only a placeholder: the camera's own
+        # limits replace it as soon as a status packet arrives
+        # (_set_exposure_limits). keyboardTracking(False) means a typed value is sent
+        # to the camera only when the edit is FINISHED (Enter or focus leaves the
+        # box), not on every keystroke -- typing "250" no longer walks the camera
+        # through 2 ms, 25 ms, 250 ms. The arrows still apply immediately.
         self.integration_spin = QDoubleSpinBox()
         self.integration_spin.setDecimals(2)
         self.integration_spin.setRange(0.01, 1000.0)
         self.integration_spin.setSingleStep(1.0)
+        self.integration_spin.setSuffix(" ms")
+        self.integration_spin.setKeyboardTracking(False)
         self.integration_spin.setValue(10.0)
         self.integration_spin.valueChanged.connect(self.on_integration_spin_changed)
-        layout.addWidget(self.integration_label)
-        layout.addWidget(self.integration_slider)
+        # Range is a placeholder until the camera reports its own limits
+        # (_set_exposure_limits, driven by the status packets).
+        self.integration_caption = QLabel("Exposure time")
+        layout.addWidget(self.integration_caption)
         layout.addWidget(self.integration_spin)
 
         self.average_spin = QSpinBox()
@@ -548,26 +550,44 @@ class MainWindow(QMainWindow):
         else:
             self.save_status_label.setText("Save FAILED (see console)")
 
+    def _set_exposure_limits(self, min_ms: float, max_ms: float) -> None:
+        """Adopt the exposure range the CAMERA reports (it moves with ROI /
+        binning / readout). No-op when unchanged, so this is cheap to call on
+        every status packet."""
+        spin = self.integration_spin
+        if (abs(spin.minimum() - min_ms) < 1e-9
+                and abs(spin.maximum() - max_ms) < 1e-9):
+            return
+        if spin.hasFocus():
+            return          # mid-edit: retry on the next status packet
+        # Enough decimals to actually express the minimum (e.g. 0.0176 ms).
+        decimals = 2 if min_ms >= 1.0 else max(
+            2, min(6, int(math.ceil(-math.log10(min_ms))) + 2))
+        spin.blockSignals(True)          # clamping the value must not re-send it
+        spin.setDecimals(decimals)
+        spin.setRange(min_ms, max_ms)
+        spin.blockSignals(False)
+        text = f"Exposure time ({min_ms:.6g} - {max_ms:.6g} ms)"
+        self.integration_caption.setText(text)
+        spin.setToolTip("Range reported by the camera for the current "
+                        "ROI / binning.")
+
     def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
-        integration_ms = float(np.clip(integration_ms, 0.01, 1000.0))
-        self.integration_label.setText(f"Exposure time: {integration_ms:.2f} ms")
+        integration_ms = float(np.clip(integration_ms,
+                                       self.integration_spin.minimum(),
+                                       self.integration_spin.maximum()))
 
-        slider_value = int(round(integration_ms * 100.0))
-        if self.integration_slider.value() != slider_value:
-            self.integration_slider.blockSignals(True)
-            self.integration_slider.setValue(slider_value)
-            self.integration_slider.blockSignals(False)
-
-        if abs(self.integration_spin.value() - integration_ms) > 1e-6:
+        # Don't echo the camera's value back into the box while it is being
+        # typed in -- that would wipe a half-entered number before it is
+        # committed. The camera's own exposure is shown by exposure_status_label.
+        if (abs(self.integration_spin.value() - integration_ms) > 1e-6
+                and not self.integration_spin.hasFocus()):
             self.integration_spin.blockSignals(True)
             self.integration_spin.setValue(integration_ms)
             self.integration_spin.blockSignals(False)
 
         if emit:
             self.control_queue.put({"type": "set_exposure", "value": integration_ms})
-
-    def on_integration_slider_changed(self, value: int) -> None:
-        self._set_integration_value(value / 100.0, emit=True)
 
     def on_integration_spin_changed(self, value: float) -> None:
         self._set_integration_value(value, emit=True)
@@ -852,6 +872,10 @@ class MainWindow(QMainWindow):
         exposure_ms = float(status.get("exposure_ms", 0.3) or 0.3)
         self.average_label.setText(f"Averaging: {average_count}")
         self.exposure_status_label.setText(f"Exposure: {exposure_ms:.2f} ms")
+        exp_min = float(status.get("exposure_min_ms", 0.0) or 0.0)
+        exp_max = float(status.get("exposure_max_ms", 0.0) or 0.0)
+        if exp_min > 0.0 and exp_max > exp_min:
+            self._set_exposure_limits(exp_min, exp_max)
         if self.average_spin.value() != average_count:
             self.average_spin.blockSignals(True)
             self.average_spin.setValue(average_count)

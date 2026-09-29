@@ -23,6 +23,8 @@ class CameraStatus:
     job_file_path: str = ""
     average_count: int = 1
     exposure_ms: float = 10.0
+    exposure_min_ms: float = 0.01        # exposure limits reported by the camera
+    exposure_max_ms: float = 1000.0      # (depend on ROI / binning / readout)
     binning: int = 1                     # hardware binning factor (1, 2, 4)
     roi_hsize: int = 0                   # hardware subarray, unbinned sensor px
     roi_vsize: int = 0                   # (0 x 0 = full frame)

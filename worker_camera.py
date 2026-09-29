@@ -45,6 +45,8 @@ def publish_status(frame_queue: mp.Queue, status: CameraStatus) -> None:
             "serial_number": status.serial_number,
             "average_count": status.average_count,
             "exposure_ms": status.exposure_ms,
+            "exposure_min_ms": status.exposure_min_ms,
+            "exposure_max_ms": status.exposure_max_ms,
             "frame_counter": status.frame_counter,
             "raw_peak_count": status.raw_peak_count,
             "board_temp_c": status.board_temp_c,

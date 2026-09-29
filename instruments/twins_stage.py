@@ -46,8 +46,8 @@ PM_PER_MM = 1_000_000_000        # picometres per millimetre (MCS2 linear units)
 # TWINS wedge park positions (mm). These are interferometer-specific -- tune
 # HOME/SAFE and the scan range to YOUR TWINS unit and its ZPD (see the Measure
 # tab defaults and instruments/calibration.py).
-HOME_POSITION_MM = 19.0          # parked/working position after referencing
-SAFE_POSITION_MM = 25.0          # parked position on disconnect
+HOME_POSITION_MM = 0.0          # parked/working position after referencing
+SAFE_POSITION_MM = 0.0          # parked position on disconnect
 
 # -- MCS2 motion defaults (converted to pm at connect) ------------------------
 DEFAULT_VELOCITY_MM_S = 5.0      # closed-loop move velocity
@@ -273,7 +273,16 @@ class TwinsStage:
 
 if __name__ == "__main__":
     st = TwinsStage()
-    st.connect(simulate=True)
-    st.move_to(24.0); st.wait_for_stop()
-    print("pos:", st.get_position(), "mm")
+    sim = False
+
+    if sim:
+        # Simulation 
+        st.connect(simulate=True)
+        st.move_to(24.0); st.wait_for_stop()
+        print("pos:", st.get_position(), "mm")
+    else:
+        # Real device
+        st.connect()
+        print('Smaract stage connected')
+
     st.disconnect()
