@@ -43,9 +43,22 @@ from typing import Optional
 # -- unit / geometry constants ------------------------------------------------
 PM_PER_MM = 1_000_000_000        # picometres per millimetre (MCS2 linear units)
 
+# -- travel limits (mm) -------------------------------------------------------
+# The MCS2 does NOT know the usable travel of this wedge: RANGE_LIMIT_MIN/MAX
+# and DEFAULT_RANGE_LIMIT_MIN/MAX all read 0 on this controller, and the manual
+# states no range limit is set by default (a limit exists only once MAX is set
+# above MIN). So the span is defined HERE and checked in software before every
+# move -- the positioner would otherwise happily drive into its end stop.
+#
+# Positions are in the CURRENT referenced coordinates (they can be negative).
+# Measure the real end points on the rig and tune these to it.
+TRAVEL_MIN_MM = -16.5           # most negative position a move may target
+TRAVEL_MAX_MM = 18.8            # most positive position a move may target
+
 # TWINS wedge park positions (mm). These are interferometer-specific -- tune
 # HOME/SAFE and the scan range to YOUR TWINS unit and its ZPD (see the Measure
-# tab defaults and instruments/calibration.py).
+# tab defaults and instruments/calibration.py). Both must lie inside the travel
+# limits above; _check_travel_constants() verifies that at import.
 HOME_POSITION_MM = 0.0          # parked/working position after referencing
 SAFE_POSITION_MM = 0.0          # parked position on disconnect
 
@@ -54,6 +67,32 @@ DEFAULT_VELOCITY_MM_S = 5.0      # closed-loop move velocity
 DEFAULT_ACCEL_MM_S2 = 20.0       # closed-loop move acceleration
 DEFAULT_HOLD_TIME_MS = 1000      # hold target position after a move (ms)
 DEFAULT_CHANNEL = 0              # MCS2 channel index of the wedge positioner
+
+
+def travel_range_mm() -> tuple:
+    """(min_mm, max_mm) the wedge may be commanded to -- the software limits."""
+    return (TRAVEL_MIN_MM, TRAVEL_MAX_MM)
+
+
+def in_travel_range(position_mm: float) -> bool:
+    """True when `position_mm` is a legal move target."""
+    return TRAVEL_MIN_MM <= float(position_mm) <= TRAVEL_MAX_MM
+
+
+def _check_travel_constants() -> None:
+    """The park positions must be reachable, or connect/disconnect would refuse
+    to move. Caught at import instead of mid-experiment."""
+    if TRAVEL_MAX_MM <= TRAVEL_MIN_MM:
+        raise ValueError(f"TRAVEL_MAX_MM ({TRAVEL_MAX_MM}) must exceed "
+                         f"TRAVEL_MIN_MM ({TRAVEL_MIN_MM})")
+    for name, value in (("HOME_POSITION_MM", HOME_POSITION_MM),
+                        ("SAFE_POSITION_MM", SAFE_POSITION_MM)):
+        if not in_travel_range(value):
+            raise ValueError(f"{name} ({value} mm) is outside the travel limits "
+                             f"{TRAVEL_MIN_MM} .. {TRAVEL_MAX_MM} mm")
+
+
+_check_travel_constants()
 
 
 class TwinsStage:
@@ -71,9 +110,14 @@ class TwinsStage:
     # -- connection ----------------------------------------------------------
     def connect(self, locator: Optional[str] = None, simulate: bool = False,
                 home: bool = True, channel: Optional[int] = None,
-                dll_path: Optional[str] = None) -> bool:
+                dll_path: Optional[str] = None, reference: bool = True) -> bool:
         """Open the MCS2 (or a simulated stage). `locator` may be an explicit
-        MCS2 device string; if None the first discovered device is used."""
+        MCS2 device string; if None the first discovered device is used.
+
+        `reference=False` opens the controller WITHOUT referencing it -- nothing
+        moves, so the reference state can be read (`is_referenced()`). The
+        `home` park move is then skipped too unless the axis already holds its
+        reference, since an absolute move is only meaningful once referenced."""
         if self.is_connected:
             return True
         if channel is not None:
@@ -108,8 +152,9 @@ class TwinsStage:
         self.is_connected = True
         try:
             self._configure_channel()
-            self._ensure_referenced()
-            if home:
+            if reference:
+                self._ensure_referenced()
+            if home and self.is_referenced():
                 self.move_to(HOME_POSITION_MM)
                 self.wait_for_stop()
         except Exception as exc:  # noqa: BLE001
@@ -140,7 +185,13 @@ class TwinsStage:
         ctl.SetProperty_i32(self.handle, ch, ctl.Property.HOLD_TIME,
                             int(DEFAULT_HOLD_TIME_MS))
 
-    def _is_referenced(self) -> bool:
+    def is_referenced(self) -> bool:
+        """True when the positioner holds a valid reference (absolute positions
+        are meaningful). Pure property read -- never moves the stage."""
+        if not self.is_connected:
+            return False
+        if self.backend == "sim":
+            return True
         try:
             state = self.ctl.GetProperty_i32(self.handle, self.channel,
                                              self.ctl.Property.CHANNEL_STATE)
@@ -150,7 +201,7 @@ class TwinsStage:
 
     def _ensure_referenced(self) -> None:
         """Reference the positioner so closed-loop absolute positions are valid."""
-        if self._is_referenced():
+        if self.is_referenced():
             return
         ctl = self.ctl
         ch = self.channel
@@ -184,8 +235,17 @@ class TwinsStage:
 
     # -- motion --------------------------------------------------------------
     def move_to(self, position_mm: float) -> bool:
-        """Closed-loop absolute move to `position_mm` (mm)."""
+        """Closed-loop absolute move to `position_mm` (mm).
+
+        Refused (returns False, nothing is commanded) when the target lies
+        outside TRAVEL_MIN_MM .. TRAVEL_MAX_MM -- the controller has no range
+        limit of its own, so this is the only thing standing between a typo and
+        the end stop."""
         if not self.is_connected:
+            return False
+        if not in_travel_range(position_mm):
+            print(f"[TwinsStage] REFUSED move to {float(position_mm):.4f} mm: "
+                  f"outside travel {TRAVEL_MIN_MM} .. {TRAVEL_MAX_MM} mm")
             return False
         if self.backend == "sim":
             self._position_mm = float(position_mm)
@@ -203,8 +263,17 @@ class TwinsStage:
             return False
 
     def move_by(self, delta_mm: float) -> bool:
-        """Relative move by `delta_mm` (mm)."""
+        """Relative move by `delta_mm` (mm).
+
+        Checked against the travel limits using the stage's CURRENT position, so
+        jogging cannot walk the wedge past an end point one step at a time."""
         if not self.is_connected:
+            return False
+        target = self.get_position() + float(delta_mm)
+        if not in_travel_range(target):
+            print(f"[TwinsStage] REFUSED jog of {float(delta_mm):+.4f} mm: "
+                  f"target {target:.4f} mm is outside travel "
+                  f"{TRAVEL_MIN_MM} .. {TRAVEL_MAX_MM} mm")
             return False
         if self.backend == "sim":
             self._position_mm += float(delta_mm)
@@ -276,13 +345,21 @@ if __name__ == "__main__":
     sim = False
 
     if sim:
-        # Simulation 
-        st.connect(simulate=True)
-        st.move_to(24.0); st.wait_for_stop()
-        print("pos:", st.get_position(), "mm")
+        # Simulation
+        if st.connect(simulate=True):
+            st.move_to(24.0); st.wait_for_stop()
+            print("pos:", st.get_position(), "mm")
+            st.disconnect(safe=False)
     else:
-        # Real device
-        st.connect()
-        print('Smaract stage connected')
-
-    st.disconnect()
+        # Real device -- READ ONLY: open the controller without referencing it
+        # and without the home/safe park moves, so nothing on the stage moves.
+        if not st.connect(home=False, reference=False):
+            raise SystemExit("Smaract stage NOT connected")
+        print("Smaract stage connected")
+        referenced = st.is_referenced()
+        print("referenced:", referenced)
+        print("travel limits:", f"{TRAVEL_MIN_MM:.4f} .. {TRAVEL_MAX_MM:.4f} mm "
+              f"(software, set in this file)")
+        print("position:", f"{st.get_position():.6f} mm"
+              + ("" if referenced else "  (not referenced -- value is meaningless)"))
+        st.disconnect(safe=False)

@@ -14,11 +14,11 @@ import numpy as np
 from pathlib import Path
 
 
-DEFAULT_START_MM = 23.8
-DEFAULT_STOP_MM = 24.8
+DEFAULT_START_MM = 0
+DEFAULT_STOP_MM = 2
 DEFAULT_N_STEPS = 100
-DEFAULT_WL_START = 8.0       # µm
-DEFAULT_WL_STOP = 14.0       # µm
+DEFAULT_WL_START = 0.4       # µm
+DEFAULT_WL_STOP = 3.5       # µm
 
 DEFAULT_CALIBRATION_FILE = r".\Twins\ASRC calibration\parameters_cal.txt"
 
@@ -32,7 +32,9 @@ ZEROFILL_MAX = 4096
 
 # Centerburst (ZPD) search defaults (NIREOS TWINS wedge): the burst sits ~here
 # with small run-to-run drift; detection is the envelope max within +/- window.
-DEFAULT_ZPD_MM = 24.33
+# In the CURRENT referenced coordinates (they run negative -- see
+# instruments/twins_stage.py travel limits).
+DEFAULT_ZPD_MM = -6
 DEFAULT_ZPD_WINDOW_MM = 0.1
 
 

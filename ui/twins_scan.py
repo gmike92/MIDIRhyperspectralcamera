@@ -28,6 +28,7 @@ from instruments.spectrum_processor import (
     DEFAULT_WL_START, DEFAULT_WL_STOP,
 )
 from instruments.dsp import APOD_TYPES
+from instruments.twins_stage import TRAVEL_MIN_MM, TRAVEL_MAX_MM
 
 
 class TwinsScanPanel(QWidget):
@@ -98,7 +99,7 @@ class TwinsScanPanel(QWidget):
         grid = QGridLayout(g)
 
         self.spin_start = QDoubleSpinBox()
-        self.spin_start.setRange(0.0, 50.0)
+        self.spin_start.setRange(TRAVEL_MIN_MM, TRAVEL_MAX_MM)
         self.spin_start.setDecimals(3)
         self.spin_start.setSingleStep(0.1)
         self.spin_start.setValue(DEFAULT_START_MM)
@@ -108,7 +109,7 @@ class TwinsScanPanel(QWidget):
         grid.addWidget(self.spin_start, 0, 1)
 
         self.spin_stop = QDoubleSpinBox()
-        self.spin_stop.setRange(0.0, 50.0)
+        self.spin_stop.setRange(TRAVEL_MIN_MM, TRAVEL_MAX_MM)
         self.spin_stop.setDecimals(3)
         self.spin_stop.setSingleStep(0.1)
         self.spin_stop.setValue(DEFAULT_STOP_MM)

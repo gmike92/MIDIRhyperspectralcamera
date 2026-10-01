@@ -25,9 +25,9 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
+    QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 # Disk-space guards for saving hypercubes (large files).
@@ -57,6 +57,7 @@ from instruments.hyperspectral import (
     DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM,
 )
 from instruments.dsp import APOD_TYPES
+from instruments.twins_stage import TRAVEL_MIN_MM, TRAVEL_MAX_MM
 
 
 # grey and jet aren't bundled in pyqtgraph and need matplotlib (absent here), so
@@ -554,6 +555,7 @@ class MeasurePanel(QWidget):
         for chk in self._persisted_checks().values():   # sat, zscan, zones
             chk.toggled.connect(self._save_settings)
         self.edit_filename.editingFinished.connect(self._save_settings)
+        self.edit_dir.editingFinished.connect(self._save_settings)
 
         self.sig_status.connect(self._on_status)
         self.sig_done.connect(self._on_done)
@@ -842,10 +844,22 @@ class MeasurePanel(QWidget):
             "  Both -> both files.")
         row3.addWidget(QLabel("Save as")); row3.addWidget(self.combo_save, 1)
         v.addLayout(row3)
+        row_dir = QHBoxLayout()
+        self.edit_dir = QLineEdit(self._camera_dir())
+        self.edit_dir.setToolTip(
+            "Where this measurement's files are written. Each Acquire creates "
+            "<date>.<filename>/ inside it. Leave empty to follow the camera "
+            "panel's save folder.")
+        self.btn_dir = QPushButton("Browse...")
+        self.btn_dir.clicked.connect(self._browse_dir)
+        row_dir.addWidget(QLabel("Save folder"))
+        row_dir.addWidget(self.edit_dir, 1)
+        row_dir.addWidget(self.btn_dir)
+        v.addLayout(row_dir)
         row4 = QHBoxLayout()
         self.edit_filename = QLineEdit("hyperspectral")
         self.edit_filename.setToolTip("Base filename; files are saved as "
-                                      "<date>.<filename> in the camera's save folder.")
+                                      "<date>.<filename> in the save folder above.")
         row4.addWidget(QLabel("Filename")); row4.addWidget(self.edit_filename, 1)
         v.addLayout(row4)
         self.chk_save_raw = QCheckBox("Raw interferogram saved for reprocessing (always)")
@@ -861,10 +875,38 @@ class MeasurePanel(QWidget):
         self.lbl_status.setWordWrap(True); v.addWidget(self.lbl_status)
         return g
 
+    # -- save folder ---------------------------------------------------------
+    def _camera_dir(self) -> str:
+        """The camera panel's save folder (the default for this panel)."""
+        return (self.save_dir_provider() if self.save_dir_provider
+                else None) or self.save_dir
+
+    def _measure_dir(self) -> str:
+        """Where THIS panel writes. The box in the Run group wins; an empty box
+        falls back to the camera panel's folder."""
+        typed = self.edit_dir.text().strip() if hasattr(self, "edit_dir") else ""
+        return typed or self._camera_dir()
+
+    def _browse_dir(self) -> None:
+        start = self._measure_dir()
+        if not os.path.isdir(start):
+            start = ""
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Folder for hyperspectral measurements", start)
+        if chosen:
+            self.edit_dir.setText(os.path.normpath(chosen))
+            self._save_settings()
+
     # -- small spin helpers --------------------------------------------------
     def _mm_spin(self, val):
-        s = QDoubleSpinBox(); s.setRange(0.0, 50.0); s.setDecimals(3)
-        s.setSingleStep(0.1); s.setValue(val); s.setSuffix(" mm"); return s
+        """Wedge position: limited to the software travel (which may be negative
+        -- the controller has no range limit of its own)."""
+        s = QDoubleSpinBox(); s.setRange(TRAVEL_MIN_MM, TRAVEL_MAX_MM)
+        s.setDecimals(3)
+        s.setSingleStep(0.1); s.setValue(val); s.setSuffix(" mm")
+        s.setToolTip(f"Travel limits (instruments/twins_stage.py): "
+                     f"{TRAVEL_MIN_MM} .. {TRAVEL_MAX_MM} mm")
+        return s
 
     def _um_spin(self, val):
         s = QDoubleSpinBox(); s.setRange(0.1, 100.0); s.setDecimals(2)
@@ -969,6 +1011,9 @@ class MeasurePanel(QWidget):
         fn = self._settings.value("ks_filename", None)
         if fn is not None:
             self.edit_filename.setText(str(fn))
+        d = self._settings.value("ks_dir", None)
+        if d is not None and str(d).strip():
+            self.edit_dir.setText(str(d))
 
     def _save_settings(self, *args) -> None:
         for key, (widget, _cast) in self._persisted_spins().items():
@@ -980,6 +1025,7 @@ class MeasurePanel(QWidget):
         for key, chk in self._persisted_checks().items():
             self._settings.setValue(key, chk.isChecked())
         self._settings.setValue("ks_filename", self.edit_filename.text())
+        self._settings.setValue("ks_dir", self.edit_dir.text())
 
     def _update_step(self) -> None:
         n = self.spin_steps.value()
@@ -1141,8 +1187,7 @@ class MeasurePanel(QWidget):
         )
         # Each Acquire = one experiment "run": save ALL its files into a folder
         # named <run-timestamp>.<filename> under the camera folder.
-        camera_folder = (self.save_dir_provider() if self.save_dir_provider
-                         else None) or self.save_dir
+        camera_folder = self._measure_dir()
         # --- Disk-space check: estimate the data size and warn if the save volume
         # is low (do this BEFORE freezing the UI / starting the thread). ---
         frame = self.frame_source()
@@ -1613,7 +1658,7 @@ class MeasurePanel(QWidget):
         stamp = getattr(self, "_run_stamp", None)
         fname = getattr(self, "_save_fname", None) or self.edit_filename.text().strip() or "hyperspectral"
         if not folder or not stamp:
-            base = (self.save_dir_provider() if self.save_dir_provider else None) or self.save_dir
+            base = self._measure_dir()
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             folder = os.path.join(base, f"{stamp}.{fname}")
         os.makedirs(folder, exist_ok=True)
@@ -1752,9 +1797,7 @@ class MeasurePanel(QWidget):
             self.lbl_status.setText(f"save error: {e}")
 
     def _load(self) -> None:
-        from PyQt6.QtWidgets import QFileDialog
-        folder = (self.save_dir_provider() if self.save_dir_provider
-                  else None) or self.save_dir
+        folder = self._measure_dir()
         start = folder if os.path.isdir(folder) else ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Load hyperspectral measurement", start, "NumPy archive (*.npz)")

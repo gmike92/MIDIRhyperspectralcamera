@@ -18,11 +18,11 @@ from pathlib import Path
 # ----------------------------------------------------------------------------
 # Defaults (from the repo)
 # ----------------------------------------------------------------------------
-DEFAULT_START_MM = 23.8     # Default start position (mm)
-DEFAULT_STOP_MM = 24.8      # Default stop position (mm)
+DEFAULT_START_MM = 0     # Default start position (mm)
+DEFAULT_STOP_MM = 2      # Default stop position (mm)
 DEFAULT_N_STEPS = 120       # Default number of steps
-DEFAULT_WL_START = 8.0      # Spectrum display start (µm)
-DEFAULT_WL_STOP = 14.0      # Spectrum display stop (µm)
+DEFAULT_WL_START = 0.40      # Spectrum display start (µm)
+DEFAULT_WL_STOP = 3.5      # Spectrum display stop (µm)
 
 # Calibration file path
 DEFAULT_CALIBRATION_FILE = r".\Twins\ASRC calibration\parameters_cal.txt"

@@ -576,12 +576,18 @@ class MainWindow(QMainWindow):
     def on_apply_roi(self) -> None:
         """Set the camera hardware subarray to the dragged box. The box is in the
         CURRENT delivered-frame pixels, which may already be a subarray at offset
-        (roi_hpos, roi_vpos) and binned, so map it back to unbinned sensor px."""
+        (roi_hpos, roi_vpos) and binned, so map it back to unbinned sensor px.
+
+        The delivered frame is flipped top-to-bottom by the worker (the sensor's
+        row 0 images the BOTTOM of the scene), so the box's rows must be mirrored
+        back into sensor order before they mean anything to DCAM -- without that
+        the camera crops the band mirrored about the frame's horizontal centre."""
         box = self._roi_box_bounds()
         if box is None:
             self.status_label.setText("Draw the ROI box on the image first (tick 'Show camera ROI').")
             return
         r0, r1, c0, c1 = box
+        frame_h = int(self.latest_frame.shape[0])
         s = self.latest_status or {}
         binning = int(s.get("binning", 1) or 1)
         off_h = int(s.get("roi_hpos", 0) or 0)
@@ -589,7 +595,7 @@ class MainWindow(QMainWindow):
         hsize = (c1 - c0) * binning
         vsize = (r1 - r0) * binning
         hpos = off_h + c0 * binning
-        vpos = off_v + r0 * binning
+        vpos = off_v + (frame_h - r1) * binning      # un-flip: display row -> sensor row
         self.control_queue.put({"type": "set_roi", "hsize": hsize, "vsize": vsize,
                                 "hpos": hpos, "vpos": vpos})
         # The delivered frame becomes the ROI, so the box's old coords are stale:

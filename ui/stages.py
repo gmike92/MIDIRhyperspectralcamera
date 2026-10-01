@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 
 from instruments.stage_driver import DelayStage
 from instruments.rotator_stage import RotatorStage
-from instruments.twins_stage import TwinsStage
+from instruments.twins_stage import TwinsStage, TRAVEL_MIN_MM, TRAVEL_MAX_MM
 
 
 class StageController(QtCore.QObject):
@@ -309,7 +309,11 @@ class StagesPanel(QWidget):
         go = QHBoxLayout()
         go.addWidget(QLabel("Go to"))
         self.t_goto = QDoubleSpinBox()
-        self.t_goto.setRange(0, 30)
+        # Software travel limits (the controller enforces none) -- the wedge
+        # coordinates can be negative, so never assume a 0 lower bound.
+        self.t_goto.setRange(TRAVEL_MIN_MM, TRAVEL_MAX_MM)
+        self.t_goto.setToolTip(f"Travel limits (instruments/twins_stage.py): "
+                               f"{TRAVEL_MIN_MM} .. {TRAVEL_MAX_MM} mm")
         self.t_goto.setDecimals(3)
         self.t_goto.setValue(24.0)
         self.t_goto.setSuffix(" mm")
