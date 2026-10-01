@@ -13,3 +13,5 @@ loguru
 #  - SmarAct MCS2 SDK  (smaract.ctl / SmarActCTL.dll)   (TWINS wedge, SLC-2460)
 #      pip package: `smaract` (from the SmarAct MCS2 software installer)
 #  - Thorlabs Kinesis + pythonnet           (optional delay stage + rotator, KDC101)
+#  - python-seabreeze + pyusb + libusb    (OceanOptics spectrometer, spectral_calib_smaract.py)
+#      pip install seabreeze pyusb libusb-package   (pyseabreeze backend over the WinUSB driver)
