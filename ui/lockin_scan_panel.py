@@ -24,7 +24,9 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from instruments.lockin_scan import LockInScanner, recommended_settle_factor
+from instruments.lockin_scan import (
+    DEFAULT_DWELL_S, LockInScanner, dwell_warning,
+)
 
 DEFAULT_SAVE_DIR = r"D:\LOCKIN"
 
@@ -140,83 +142,48 @@ class LockInScanPanel(QWidget):
 
     # -- timing --------------------------------------------------------------
     def _build_timing_group(self) -> QGroupBox:
-        g = QGroupBox("Synchronisation")
+        g = QGroupBox("Measurement")
         grid = QGridLayout(g)
 
-        self.spin_settle_factor = QDoubleSpinBox()
-        self.spin_settle_factor.setRange(0.0, 50.0)
-        self.spin_settle_factor.setDecimals(1)
-        self.spin_settle_factor.setSingleStep(0.5)
-        self.spin_settle_factor.setValue(5.0)
-        self.spin_settle_factor.setSuffix(" × τ")
-        self.spin_settle_factor.setToolTip(
-            "Wait this many lock-in time constants after each move before "
-            "reading. The output is the input through a low-pass filter, so it "
-            "needs several τ to forget the previous position.\n"
-            "Rule of thumb: 3τ at 6 dB/oct, 6τ at 24 dB/oct.")
-        self.spin_settle_factor.valueChanged.connect(self._update_derived)
-        grid.addWidget(QLabel("Settle"), 0, 0)
-        grid.addWidget(self.spin_settle_factor, 0, 1)
+        self.spin_dwell = QDoubleSpinBox()
+        self.spin_dwell.setRange(0.001, 3600.0)
+        self.spin_dwell.setDecimals(3)
+        self.spin_dwell.setSingleStep(0.1)
+        self.spin_dwell.setValue(DEFAULT_DWELL_S)
+        self.spin_dwell.setSuffix(" s")
+        self.spin_dwell.setToolTip(
+            "How long to stay at each position. The lock-in is read as fast as "
+            "the link allows for this long, and the point is the mean of every "
+            "reading taken.\n\n"
+            "Longer = better averaging and a slower scan. Keep it comfortably "
+            "longer than the lock-in's time constant, or the average is biased "
+            "by the settling transient from the previous position.")
+        self.spin_dwell.valueChanged.connect(self._update_derived)
+        grid.addWidget(QLabel("Dwell time"), 0, 0)
+        grid.addWidget(self.spin_dwell, 0, 1)
 
-        self.btn_auto_settle = QPushButton("Auto")
-        self.btn_auto_settle.setFixedWidth(46)
-        self.btn_auto_settle.setToolTip(
-            "Set the settle factor from the filter slope on the instrument")
-        self.btn_auto_settle.clicked.connect(self._auto_settle_factor)
-        grid.addWidget(self.btn_auto_settle, 0, 2)
-
-        self.spin_extra_settle = QDoubleSpinBox()
-        self.spin_extra_settle.setRange(0.0, 60.0)
-        self.spin_extra_settle.setDecimals(3)
-        self.spin_extra_settle.setSingleStep(0.05)
-        self.spin_extra_settle.setSuffix(" s")
-        self.spin_extra_settle.setToolTip(
-            "Fixed extra dwell added on top of the τ-based settle (mechanical "
-            "ringing, chopper re-lock, ...)")
-        self.spin_extra_settle.valueChanged.connect(self._update_derived)
-        grid.addWidget(QLabel("Extra dwell"), 1, 0)
-        grid.addWidget(self.spin_extra_settle, 1, 1, 1, 2)
-
-        self.spin_samples = QSpinBox()
-        self.spin_samples.setRange(1, 1000)
-        self.spin_samples.setValue(1)
-        self.spin_samples.setToolTip(
-            "Reads averaged per position. Their spread is saved as the point's "
-            "error bar.")
-        self.spin_samples.valueChanged.connect(self._update_derived)
-        grid.addWidget(QLabel("Samples/point"), 2, 0)
-        grid.addWidget(self.spin_samples, 2, 1, 1, 2)
-
-        self.spin_sample_interval = QDoubleSpinBox()
-        self.spin_sample_interval.setRange(0.0, 10.0)
-        self.spin_sample_interval.setDecimals(3)
-        self.spin_sample_interval.setSingleStep(0.01)
-        self.spin_sample_interval.setSuffix(" s")
-        self.spin_sample_interval.setSpecialValueText("auto (1 × τ)")
-        self.spin_sample_interval.setToolTip(
-            "Gap between averaged samples. 0 = one time constant, so the "
-            "samples are (nearly) independent instead of N copies of the same "
-            "filtered value.")
-        self.spin_sample_interval.valueChanged.connect(self._update_derived)
-        grid.addWidget(QLabel("Sample gap"), 3, 0)
-        grid.addWidget(self.spin_sample_interval, 3, 1, 1, 2)
+        self.lbl_dwell_check = QLabel("--")
+        self.lbl_dwell_check.setWordWrap(True)
+        self.lbl_dwell_check.setStyleSheet("color:#888; font-size:11px;")
+        grid.addWidget(self.lbl_dwell_check, 1, 0, 1, 2)
 
         self.chk_xyr = QCheckBox("Also record X, Y, R")
         self.chk_xyr.setChecked(True)
         self.chk_xyr.setToolTip(
-            "One extra SNAP? per point. Costs a round trip, but saves the full "
-            "quadrature information so the scan can be re-phased afterwards.")
-        grid.addWidget(self.chk_xyr, 4, 0, 1, 3)
+            "Average the quadratures over the same window, so the scan can be "
+            "re-phased afterwards. Free when the recorded channel is X, Y or R "
+            "(one SNAP? gives all of them); otherwise it halves the read rate.")
+        grid.addWidget(self.chk_xyr, 2, 0, 1, 2)
 
         self.chk_return = QCheckBox("Return to start when done")
         self.chk_return.setChecked(False)
-        grid.addWidget(self.chk_return, 5, 0, 1, 3)
+        grid.addWidget(self.chk_return, 3, 0, 1, 2)
 
         self.lbl_estimate = QLabel("--")
         self.lbl_estimate.setStyleSheet("color:#888; font-size:11px;")
         self.lbl_estimate.setWordWrap(True)
-        grid.addWidget(QLabel("Estimate"), 6, 0)
-        grid.addWidget(self.lbl_estimate, 6, 1, 1, 2)
+        grid.addWidget(QLabel("Estimate"), 4, 0)
+        grid.addWidget(self.lbl_estimate, 4, 1)
         return g
 
     # -- save ----------------------------------------------------------------
@@ -267,18 +234,6 @@ class LockInScanPanel(QWidget):
             return
         spin.setValue(pos)
 
-    def _auto_settle_factor(self) -> None:
-        lockin = self.lockin_panel.lockin
-        if not lockin.is_connected:
-            self.sig_status.emit("lock-in not connected")
-            return
-        try:
-            factor = recommended_settle_factor(lockin.filter_slope)
-        except Exception as e:  # noqa: BLE001
-            self.sig_status.emit(f"could not read filter slope: {e}")
-            return
-        self.spin_settle_factor.setValue(factor)
-
     def _current_tau(self) -> float:
         """The time constant the estimate is based on: live from the instrument
         when connected, otherwise whatever the Lock-in tab is showing."""
@@ -297,16 +252,24 @@ class LockInScanPanel(QWidget):
         self.lbl_step.setText(f"{span / (n - 1) * 1000:.3f} µm" if n > 1 else "-- µm")
         self.lbl_channel.setText(self.lockin_panel.channel)
 
+        dwell = self.spin_dwell.value()
         tau = self._current_tau()
-        gap = self.spin_sample_interval.value() or tau
-        settle = self.spin_settle_factor.value() * tau + self.spin_extra_settle.value()
-        per_point = settle + max(0, self.spin_samples.value() - 1) * gap
+        warning = dwell_warning(dwell, tau)
+        if warning:
+            self.lbl_dwell_check.setText(warning)
+            self.lbl_dwell_check.setStyleSheet(
+                "color:#c92a2a; font-size:11px; font-weight:600;")
+        else:
+            self.lbl_dwell_check.setText(
+                f"{dwell / tau:.0f} × the {tau:g} s time constant"
+                if tau > 0 else "time constant unknown (lock-in offline)")
+            self.lbl_dwell_check.setStyleSheet("color:#888; font-size:11px;")
+
         # ~40 ms of stage move + handshake per point is what this rig measures;
         # it is only a rough guide, so it stays a constant rather than a setting.
-        total = n * (per_point + 0.04)
+        total = n * (dwell + 0.04)
         self.lbl_estimate.setText(
-            f"τ = {tau:g} s → {settle:.3f} s settle, {per_point:.3f} s/point, "
-            f"≈ {_fmt_duration(total)} total")
+            f"{dwell:g} s/point → ≈ {_fmt_duration(total)} total")
 
     # -- run -----------------------------------------------------------------
     def _start_scan(self) -> None:
@@ -325,10 +288,7 @@ class LockInScanPanel(QWidget):
         stop = self.spin_stop.value()
         n = self.spin_steps.value()
         parameter = self.lockin_panel.channel
-        samples = self.spin_samples.value()
-        gap = self.spin_sample_interval.value() or None      # 0 -> auto (1 tau)
-        settle_factor = self.spin_settle_factor.value()
-        extra = self.spin_extra_settle.value()
+        dwell = self.spin_dwell.value()
         record_xyr = self.chk_xyr.isChecked()
         return_to_start = self.chk_return.isChecked()
 
@@ -344,10 +304,7 @@ class LockInScanPanel(QWidget):
                 pos, val = self.scanner.scan(
                     start, stop, n,
                     parameter=parameter,
-                    samples=samples,
-                    sample_interval_s=gap,
-                    settle_factor=settle_factor,
-                    extra_settle_s=extra,
+                    dwell_s=dwell,
                     record_xyr=record_xyr,
                     progress=lambda i, t, p, v: self.sig_progress.emit(i, t, p, v),
                     should_abort=lambda: self._abort,
@@ -433,9 +390,10 @@ class LockInScanPanel(QWidget):
         try:
             with open(stem + ".csv", "w", newline="") as f:
                 writer = csv.writer(f)
-                columns = ["position_mm", "target_mm", "value", "error", "time_s"]
+                columns = ["position_mm", "target_mm", "value", "error",
+                           "reads", "time_s"]
                 arrays = [data["positions_mm"], data["targets_mm"], data["values"],
-                          data["errors"], data["timestamps_s"]]
+                          data["errors"], data["reads"], data["timestamps_s"]]
                 if "x" in data:
                     columns += ["x", "y", "r"]
                     arrays += [data["x"], data["y"], data["r"]]
@@ -458,10 +416,7 @@ class LockInScanPanel(QWidget):
             "start": self.spin_start,
             "stop": self.spin_stop,
             "steps": self.spin_steps,
-            "settle_factor": self.spin_settle_factor,
-            "extra_settle": self.spin_extra_settle,
-            "samples": self.spin_samples,
-            "sample_interval": self.spin_sample_interval,
+            "dwell": self.spin_dwell,
         }
 
     def _restore_settings(self) -> None:

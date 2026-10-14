@@ -33,7 +33,7 @@ two share `instruments/` but nothing else.
   records.
 - **Stage** — MCS2 locator + channel, connect, find reference, calibrate,
   absolute move, jog, velocity/acceleration, stop.
-- **Scan** — start/stop/steps, the synchronisation timings, and saving.
+- **Scan** — start/stop/steps, the dwell time, and saving.
 
 **Right — the live view**
 
@@ -62,19 +62,58 @@ Per point, in `instruments/lockin_scan.py`:
    `ACTIVELY_MOVING` clears, and fails loudly on `MOVEMENT_FAILED` (end stop,
    range limit, following error). MCS2 move commands are asynchronous, so this
    handshake is what makes the scan a *step* scan rather than a race.
-3. **Settle** — `settle_factor × τ + extra dwell`, where τ is the lock-in time
-   constant read live off the instrument. This is the part that matters: the
-   lock-in output is the input through a low-pass filter, so after a step it
-   needs several τ to forget the previous position. *Auto* sets the factor from
-   the filter slope actually configured (3τ at 6 dB/oct → 6τ at 24 dB/oct).
-4. **Read** — `samples` reads of the selected channel, one *sample gap* apart
-   (default: one τ, so the samples are nearly independent rather than N copies
-   of the same filtered value). The mean is the point; their spread is saved as
-   its error bar.
-5. Optionally one extra `SNAP? X,Y,R` so the scan can be re-phased afterwards.
+3. **Dwell** — read the lock-in as fast as the link allows for **dwell time**
+   seconds. The point is the **mean of every reading taken** in that window,
+   its error bar is their standard deviation, and `reads` records how many
+   there were (typically thousands per second over LAN/USB).
 
-The **Estimate** line on the Scan tab turns those settings into a per-point time
-and a total scan duration before you start.
+**Dwell time is the only timing control.** Longer dwell = better averaging and
+a slower scan; the *Estimate* line turns it into a total scan duration before
+you start.
+
+### Keep the dwell longer than the time constant
+
+The window average includes the lock-in's settling transient at the start — its
+output is the input through a low-pass filter, so it takes a few time constants
+to forget the previous position. That bias is negligible while the dwell is
+comfortably longer than τ and grows as the two approach each other.
+
+The panel reads τ off the instrument and shows the ratio under the dwell box:
+
+```
+5 × the 0.1 s time constant                       <- fine
+dwell 0.05 s is only 0.5 x the 0.1 s time constant
+  -- the average is biased by the settling transient.
+  Use at least 0.5 s, or shorten the time constant on the lock-in.
+```
+
+Below **5 τ** it turns red and the warning is saved with the scan as
+`dwell_warning`. Either lengthen the dwell or shorten τ on the lock-in — both
+fix it.
+
+> **Symptom of too short a dwell:** reduced amplitude, washed-out fringe
+> contrast, and a trace shifted along the position axis. The definitive test is
+> to scan the range forward, then swap Start and Stop and scan back — with
+> enough dwell the two traces overlay; if they are shifted apart, the dwell is
+> still too short.
+
+### The stage is checked for actually arriving
+
+MCS2 movement commands are documented *not* to report an error when the move
+cannot be processed — a wrong channel index, an unplugged positioner or a range
+limit makes `Move` silently do nothing, `wait_for_stop()` return at once, and
+the position never change. A scan would then finish looking perfectly normal
+with every point carrying the wrong position.
+
+So each point asserts the read-back position is within tolerance of the target
+(the larger of 2 µm and 20 % of the step, recorded as `position_tolerance_mm`),
+and stops the scan naming what to check if not. The scan also warns up front if
+the stage reports no position sensor or has never been referenced.
+
+Optionally the quadratures are averaged over the same window too, so the scan
+can be re-phased afterwards (*Also record X, Y, R*). That is free when the
+recorded channel is X, Y or R — a single `SNAP?` yields the point value and all
+three quadratures from the same instant — and halves the read rate otherwise.
 
 While a scan runs, both instrument panels are frozen — their poll timers stop
 and their controls grey out — so the scan thread is the only caller talking to
@@ -166,14 +205,15 @@ folder (automatically when the scan finishes, if *Save automatically* is on).
 | `positions_mm` | position **read back from the encoder** at each point   |
 | `targets_mm`   | position **commanded**                                  |
 | `values`       | the recorded channel                                    |
-| `errors`       | standard deviation of the samples averaged at that point |
+| `errors`       | standard deviation of the readings averaged at that point |
+| `reads`        | how many readings went into that point                   |
 | `timestamps_s` | seconds since the scan started                          |
 | `x`, `y`, `r`  | quadrature snapshot, if *Also record X, Y, R* was on    |
 
 The `.json` (also embedded in the `.npz` as `metadata`) holds the full scan
-configuration and the lock-in's settings at scan time: τ, filter slope,
-sensitivity, phase, reference frequency, the settle actually used, and the stage
-identification. An aborted scan saves the points it did take, truncated.
+configuration and the lock-in's settings at scan time: `dwell_s`,
+`dwell_per_tau`, any `dwell_warning`, `reads_per_point_mean`, τ, filter slope,
+sensitivity, phase, reference frequency, and the stage identification. An aborted scan saves the points it did take, truncated.
 
 ## Files
 
