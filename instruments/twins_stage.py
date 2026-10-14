@@ -1,7 +1,7 @@
 """
 twins_stage.py -- TWINS interferometer wedge stage, SmarAct MCS2 backend.
 
-This is the motorized wedge stage *inside* the NIREOS TWINS interferometer.
+This is the motorized wedge stage *inside* the TWINS interferometer.
 Stepping it changes the birefringent optical path difference (the interferometric
 delay); subtwinslv.py scans it and the app Fourier-transforms the per-pixel
 interferogram into a spectrum.
@@ -52,7 +52,7 @@ PM_PER_MM = 1_000_000_000        # picometres per millimetre (MCS2 linear units)
 #
 # Positions are in the CURRENT referenced coordinates (they can be negative).
 # Measure the real end points on the rig and tune these to it.
-TRAVEL_MIN_MM = -16.5           # most negative position a move may target
+TRAVEL_MIN_MM = -13.2           # most negative position a move may target
 TRAVEL_MAX_MM = 18.8            # most positive position a move may target
 
 # TWINS wedge park positions (mm). These are interferometer-specific -- tune
@@ -64,7 +64,7 @@ SAFE_POSITION_MM = 0.0          # parked position on disconnect
 
 # -- MCS2 motion defaults (converted to pm at connect) ------------------------
 DEFAULT_VELOCITY_MM_S = 5.0      # closed-loop move velocity
-DEFAULT_ACCEL_MM_S2 = 20.0       # closed-loop move acceleration
+DEFAULT_ACCEL_MM_S2 = 10.0       # closed-loop move acceleration
 DEFAULT_HOLD_TIME_MS = 1000      # hold target position after a move (ms)
 DEFAULT_CHANNEL = 0              # MCS2 channel index of the wedge positioner
 
