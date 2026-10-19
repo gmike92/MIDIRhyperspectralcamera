@@ -55,12 +55,30 @@ _position_cache = None
 _position_path = None    # name of the position-cal file actually loaded
 
 
-def _read_two_row_file(path: Path):
-    """Read a tab-separated file with two rows: row 0 = x-axis, row 1 = y-axis."""
+def read_two_row_calibration(path: Path):
+    """Read a tab-separated file with two rows: row 0 = x-axis, row 1 = y-axis.
+
+    Only the first two rows are parsed (``nrows=2``) and the result is checked,
+    because a file in the wrong layout keeps pandas busy for minutes: one bad
+    export of parameters_cal.txt was 60k rows x 60k columns and hung the app
+    inside MeasurePanel before the main window was ever shown. Raises
+    ValueError on anything that is not a usable 2-row table, so callers warn
+    and carry on uncalibrated instead of freezing.
+    """
     import pandas as pd
-    ref = pd.read_csv(path, sep="\t", header=None)
-    return (ref.iloc[0].to_numpy(dtype="float64"),
-            ref.iloc[1].to_numpy(dtype="float64"))
+    ref = pd.read_csv(path, sep="\t", header=None, nrows=2)
+    rows, cols = ref.shape
+    if rows < 2 or cols < 2:
+        raise ValueError(f"expected 2 rows x N columns, got {rows}x{cols}")
+    x = ref.iloc[0].to_numpy(dtype="float64")
+    y = ref.iloc[1].to_numpy(dtype="float64")
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+        raise ValueError("rows 0/1 hold missing or non-numeric values "
+                         "(ragged rows, or a header line?)")
+    if np.array_equal(x, y):
+        raise ValueError("rows 0 and 1 are identical -- wrong layout "
+                         "(expected row 0 = x-axis, row 1 = y-axis)")
+    return x, y
 
 
 def get_spectral_calibration():
@@ -71,7 +89,7 @@ def get_spectral_calibration():
     for p in _SPECTRAL_PATHS:
         if p.exists():
             try:
-                wl, rk = _read_two_row_file(p)
+                wl, rk = read_two_row_calibration(p)
                 print(f"[OK] Loaded spectral calibration: {p.name}  "
                       f"({wl.min():.2f}-{wl.max():.2f} µm)")
                 _spectral_cache = (wl, rk)
@@ -95,7 +113,7 @@ def get_position_calibration():
     for p in _POSITION_PATHS:
         if p.exists():
             try:
-                pos, amp = _read_two_row_file(p)
+                pos, amp = read_two_row_calibration(p)
                 print(f"[OK] Loaded position calibration: {p.name}")
                 _position_cache = (pos, amp)
                 _position_path = p.name

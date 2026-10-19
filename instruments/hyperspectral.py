@@ -116,7 +116,6 @@ class HyperspectralProcessor:
 
     def _load_calibration(self):
         try:
-            import pandas as pd
             cal_path = Path(self.calibration_file)
             if not cal_path.exists():
                 import sys
@@ -133,9 +132,9 @@ class HyperspectralProcessor:
                         cal_path = alt
                         break
             if cal_path.exists():
-                ref = pd.read_csv(cal_path, sep="\t", header=None)
-                self.wavelength_cal = ref.iloc[0].to_numpy(dtype='float64')
-                self.reciprocal_cal = ref.iloc[1].to_numpy(dtype='float64')
+                from instruments.calibration import read_two_row_calibration
+                self.wavelength_cal, self.reciprocal_cal = \
+                    read_two_row_calibration(cal_path)
                 print(f"[OK] Hyperspectral: Loaded calibration: {cal_path.name}")
         except Exception as e:
             print(f"[WARN] Hyperspectral calibration: {e}")

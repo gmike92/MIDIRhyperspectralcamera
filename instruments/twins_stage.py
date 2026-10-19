@@ -40,6 +40,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+import numpy
+
 # -- unit / geometry constants ------------------------------------------------
 PM_PER_MM = 1_000_000_000        # picometres per millimetre (MCS2 linear units)
 
@@ -63,7 +65,7 @@ HOME_POSITION_MM = 0.0          # parked/working position after referencing
 SAFE_POSITION_MM = 0.0          # parked position on disconnect
 
 # -- MCS2 motion defaults (converted to pm at connect) ------------------------
-DEFAULT_VELOCITY_MM_S = 5.0      # closed-loop move velocity
+DEFAULT_VELOCITY_MM_S = 3.0      # closed-loop move velocity
 DEFAULT_ACCEL_MM_S2 = 10.0       # closed-loop move acceleration
 DEFAULT_HOLD_TIME_MS = 1000      # hold target position after a move (ms)
 DEFAULT_CHANNEL = 0              # MCS2 channel index of the wedge positioner
@@ -361,5 +363,21 @@ if __name__ == "__main__":
         print("travel limits:", f"{TRAVEL_MIN_MM:.4f} .. {TRAVEL_MAX_MM:.4f} mm "
               f"(software, set in this file)")
         print("position:", f"{st.get_position():.6f} mm"
-              + ("" if referenced else "  (not referenced -- value is meaningless)"))
+              + ("" if referenced else "  (not referenced -- value is meaningless)")) 
+        import numpy
+        pos = numpy.linspace(2, 5, 50)
+        for i in range(15):
+        
+            # st.move_to(15.0)
+            # st.wait_for_stop()
+            # print("pos:", st.get_position(), "mm")
+            # st.move_to(2.0)
+            # st.wait_for_stop()
+            print("pos:", st.get_position(), "mm")
+            for i in range(len(pos)):
+                st.move_to(pos[i])
+                st.wait_for_stop()
+            print("pos:", st.get_position(), "mm")
+            time.sleep(1)
+
         st.disconnect(safe=False)

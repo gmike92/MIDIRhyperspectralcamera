@@ -90,8 +90,6 @@ class SpectrumProcessor:
     def _load_calibration(self):
         """Load calibration file for wavelength conversion."""
         try:
-            import pandas as pd
-
             cal_path = Path(self.calibration_file)
             if not cal_path.exists():
                 alt_paths = [
@@ -104,9 +102,9 @@ class SpectrumProcessor:
                         break
 
             if cal_path.exists():
-                ref = pd.read_csv(cal_path, sep="\t", header=None)
-                self.wavelength_cal = ref.iloc[0].to_numpy(dtype='float64')
-                self.reciprocal_cal = ref.iloc[1].to_numpy(dtype='float64')
+                from instruments.calibration import read_two_row_calibration
+                self.wavelength_cal, self.reciprocal_cal = \
+                    read_two_row_calibration(cal_path)
                 print(f"[OK] Loaded calibration: {cal_path.name}")
                 print(f"     Wavelength range: {self.wavelength_cal.min():.2f} - {self.wavelength_cal.max():.2f} µm")
             else:
