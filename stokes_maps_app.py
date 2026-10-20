@@ -116,7 +116,7 @@ def _set_pi_ticks(cbar):
 
 
 def _sign(x):
-    """Sign map with 0 -> +1 (so an exactly-zero expression doesn't null a pixel)."""
+    """Sign map with 0 values converted to +1, so an exactly-zero expression doesn't null a pixel."""
     return np.where(np.asarray(x, float) < 0.0, -1.0, 1.0)
 
 
@@ -460,6 +460,10 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         notes = []
 
         def _dft(src, ref_raw=None):
+            # Compute the complex map at the current λ, optionally using a reference cube for phasing.
+            # This is based on HyperspectralProcessor.compute_complex_map, which handles the DFT, apodization,
+            # ZPD search, and optional phasing. Phasing consists of computing the complex map of the reference
+            # cube at the same λ and using it to correct the phase of the source cube.
             c, _ = self.proc.compute_complex_map(
                 src["pos"], src["raw"], lam, apod_type=apod, ft_window_mm=ftwin,
                 expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
@@ -580,13 +584,15 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         self.status.setText(getattr(self, "_status_base", "") + note)
 
     def _compute_stokes(self, prepared):
+        # If any of the three maps is missing, clear the Stokes row and return.
         if any(p is None for p in prepared):
             for k in range(3):
                 self.s_img[k].clear()
             self.s0_img.clear()
             self._status("   |   load all three maps for Stokes")
             return
-        shapes = {p[0].shape for p in prepared}
+        # Check that all three maps have the same shape; if not, clear the Stokes row and return.
+        shapes = {p[0].shape for p in prepared} # creating a set of shapes of the amplitude maps, i.e., dimensions must be identical 
         if len(shapes) != 1:
             for k in range(3):
                 self.s_img[k].clear()
@@ -603,8 +609,13 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         # Normalised Stokes are inherently signed; the toggle only matters otherwise.
         signed = normalize or (self.combo_mode.currentIndex() == 0)
 
+        # Amplitudes and phases of the three maps
         M1, M2, M3 = (p[0] for p in prepared)
         P1, P2, P3 = (p[2] for p in prepared)
+
+        # Combined mask: only pixels that pass all three amplitude masks are valid. 
+        # prepared[k][1] is the valid mask for map k, so we take the logical AND of all three.
+        # Calculation continues only if there aare valid pixels; otherwise return after clearing the Stokes row.
         combined = prepared[0][1] & prepared[1][1] & prepared[2][1]
         n_ok = int(np.count_nonzero(combined))
         if n_ok == 0:
@@ -614,10 +625,18 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             self._status("   |   0 pixels pass the amplitude mask — lower 'Amp mask %'")
             return
 
+        # Computes the Stokes parameters S1, S2, S3 from the amplitudes and phases of the three maps
+        # according to the formulas reported above. 
+
+            # Magnitudes should be non-negative, so the argument of the square root must be at least 0.0.
         mag = [np.sqrt(np.clip(0.5 * (M2**2 + M3**2 - M1**2), 0.0, None)),
                np.sqrt(np.clip(0.5 * (M1**2 + M3**2 - M2**2), 0.0, None)),
                np.sqrt(np.clip(0.5 * (M1**2 + M2**2 - M3**2), 0.0, None))]
-        signs = [_sign(M2 + P3), _sign(M1 + M3), _sign(P1 - P2)]
+
+            # Signs are determined by the phases of the maps
+        signs = [_sign(np.cos(P2)), _sign(np.cos(P1)), _sign(np.sin(P1))]
+        # signs = [_sign(np.cos(P2))*_sign(np.sin(P3)), _sign(np.cos(P1))*_sign(np.cos(P3)), _sign(np.sin(P1))*-_sign(np.sin(P2))]
+        # signs = [_sign(M2 + P3), _sign(M1 + M3), _sign(P1 - P2)]
         s_signed = [mag[k] * signs[k] for k in range(3)]
 
         # S0 = 2*I45 - S2, shown in the reference column whenever I45 is available.
