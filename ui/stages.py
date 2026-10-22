@@ -85,7 +85,7 @@ class StagesPanel(QWidget):
         self.twins = TwinsStage()
         # This rig has TWO KDC101 controllers; pin the rotator to its serial so
         # it never collides with the delay stage's KDC101 (and vice-versa).
-        self.rotator = RotatorStage(serial="27256774")
+        self.rotator = RotatorStage(serial="27267062")
         self.delay_ctl = StageController(
             self.delay,
             lambda d: f"{d.get_position_mm():.4f} mm")
