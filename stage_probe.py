@@ -16,7 +16,7 @@ from instruments.stage_driver import DelayStage
 
 s = DelayStage()
 s.override_limits = False          # keep the log clean; not testing limits here
-ok = s.connect(exclude=["27256774"])   # exclude the rotator KDC101
+ok = s.connect(exclude=["27267062"])   # exclude the rotator KDC101
 print("connected:", ok, "| backend:", s.backend, "| serial:", s.serial)
 if not ok or s.backend != "dotnet":
     print("Need the dotnet backend + a free stage. Is the stage disconnected in the app?")
