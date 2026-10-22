@@ -842,9 +842,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                                    "background and save the phased spectrum cubes to a folder.")
         btn_phase_stack.clicked.connect(self._phase_stack_save)
         self.chk_save_complex = QtWidgets.QCheckBox("save complex")
-        self.chk_save_complex.setToolTip("Save the COMPLEX spectrum G = F·e^{-iΦ} "
-                                         "(amplitude + phase, complex64) instead of the "
-                                         "real/absorptive part, so phase is preserved.")
+        self.chk_save_complex.setToolTip(
+            "Export the COMPLEX spectrum (complex64, amplitude + phase) instead of the "
+            "magnitude/absorptive part, so phase is preserved. Applies to both "
+            "'Recompute → save all Z' and 'Phase Z×θ stack → save'. With a phase "
+            "background loaded and subtracted it saves the phased field G = F·e^{-iΦ}; "
+            "otherwise the raw complex spectrum F.")
         pb.addWidget(btn_bkg); pb.addWidget(self.chk_phase_bkg)
         pb.addWidget(btn_phase_stack); pb.addWidget(self.chk_save_complex); pb.addStretch(1)
         ph.addLayout(pb)
@@ -2492,6 +2495,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         cmethod = self._center_method()
         if self.proc is None:
             self.proc = HyperspectralProcessor()
+        # "save complex" -> export the full complex spectrum (complex64) instead of
+        # the magnitude. If a phase background is loaded AND its subtraction is on,
+        # export the phased field G = F·e^{-iΦ} (matches the display); otherwise the
+        # raw complex spectrum F (instrument phase included).
+        complex_out = self.chk_save_complex.isChecked()
+        ref_raw = None
+        if complex_out and self.phase_bkg is not None and self.phase_bkg_on:
+            ref_raw = self._bin_raw(self.phase_bkg[0])
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         saved = 0
         try:
@@ -2514,16 +2525,22 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                     continue
                 nfreq = resolve_n_points(len(pos), manual=nfset)
                 raw_b = self._bin_raw(raw)     # recompute at the chosen binning
+                # use the background phase only if it matches this cube's geometry
+                ref = ref_raw if (ref_raw is not None
+                                  and getattr(ref_raw, "shape", None) == raw_b.shape) else None
                 wl, cube = self.proc.compute_hyperspectral(
                     pos, raw_b, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
                     search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
-                    center_method=cmethod)
+                    reference_cube=ref, center_method=cmethod, complex_out=complex_out)
                 meta.update(recompute_window_mm=win, recompute_apod=apod,
                             recompute_wl_um=[wl0, wl1], recompute_nfreq=int(nfreq),
-                            recompute_center=cmethod,
+                            recompute_center=cmethod, complex_spectrum=bool(complex_out),
+                            phase_corrected=bool(ref is not None),
                             raw_binning=1, spectrum_binning=self._recompute_bin())
-                kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
+                # complex64 keeps phase; else magnitude float32 as before.
+                sc = cube.astype(np.complex64) if complex_out else cube.astype(np.float32)
+                kw = dict(wavelengths=wl, spectrum_cube=sc,
                           z_value_mm=info["z"], z_unit="mm",
                           metadata=np.array(meta, dtype=object),
                           metadata_json=json.dumps(meta, default=str, indent=2))
