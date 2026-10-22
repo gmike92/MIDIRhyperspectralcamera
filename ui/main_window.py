@@ -164,7 +164,8 @@ class MainWindow(QMainWindow):
         viewer_column.addWidget(self.export_panel, 1)
 
         # Temperature readout — sits just above the intensity (color) bar,
-        # right-aligned. Updates every 5 min, or on demand via the Poll button.
+        # right-aligned. Updated ONLY on demand, when the user clicks the Poll
+        # button (no automatic periodic polling).
         temp_row = QHBoxLayout()
         temp_row.addStretch()
         self.temp_value_label = QLabel("FPGA/Board: -- °C   FPA: -- K")
