@@ -47,9 +47,10 @@ class RotatorStage:
 
     def __init__(self, serial: Optional[str] = None,
                  stage_name: str = "PRM1-Z8") -> None:
-        # Preferred serial: this rig has TWO KDC101 controllers (this rotator +
-        # the delay stage), so the rotator MUST target its own serial rather than
-        # auto-picking the first device found.
+        # Preferred serial (OPTIONAL): connect() searches for the KDC101 rotator
+        # (see _connect_dotnet), so the exact serial isn't required -- it's used
+        # only as a preference/tie-breaker, and connect still works if the
+        # controller is swapped for one with a different serial.
         self.preferred_serial = str(serial) if serial else None
         # Kinesis stage-settings name for the rotation mount. This is what tells
         # the controller its counts-per-degree; WITHOUT it MoveTo/Position are in
@@ -89,7 +90,9 @@ class RotatorStage:
         devices = Thorlabs.list_kinesis_devices()
         if not devices:
             return False
-        sn = serial or devices[0][0]
+        # Use the pinned serial only if present; otherwise search (first device).
+        sns = [str(d[0]) for d in devices]
+        sn = str(serial) if (serial and str(serial) in sns) else devices[0][0]
         # scale="stage" -> pylablib applies the device's stored calibration, so
         # positions/moves are in real degrees rather than raw encoder counts.
         self._stage = Thorlabs.KinesisMotor(sn, scale="stage")
@@ -101,7 +104,8 @@ class RotatorStage:
         devices = apt.list_available_devices()
         if not devices:
             return False
-        sn = int(serial) if serial else devices[0][1]
+        sns = [str(d[1]) for d in devices]
+        sn = int(serial) if (serial and str(serial) in sns) else devices[0][1]
         self._stage = apt.Motor(sn)
         self.backend, self.serial = "apt", str(sn)
         return True
@@ -123,15 +127,25 @@ class RotatorStage:
         from Thorlabs.MotionControl.DeviceManagerCLI import DeviceManagerCLI
         from Thorlabs.MotionControl.KCube.DCServoCLI import KCubeDCServo
         DeviceManagerCLI.BuildDeviceList()
-        devices = list(DeviceManagerCLI.GetDeviceList())
-        if not devices:
+        all_sns = [str(d) for d in DeviceManagerCLI.GetDeviceList()]
+        if not all_sns:
             return False
-        sns = [str(d) for d in devices]
-        if serial and serial not in sns:
-            raise RuntimeError(
-                f"rotator serial {serial} not found (Thorlabs devices present: {sns}). "
-                "Check the USB connection and that the KDC101 is powered.")
-        sn = str(serial) if serial else str(devices[0])
+        # SEARCH for the rotator so the exact serial isn't required: the rotator is
+        # a KDC101 (K-Cube DC servo, serial prefix "27") and is the ONLY KDC101 on
+        # this rig now (the delay/Z stage is an LTS300, a different prefix), so
+        # filtering to "27..." isolates it. A pinned serial is used only as a
+        # preference / tie-breaker; if it's absent we auto-pick the discovered KDC101.
+        kdc_sns = [s for s in all_sns if s.startswith("27")] or all_sns
+        if serial and str(serial) in kdc_sns:
+            sn = str(serial)
+        elif serial:
+            sn = kdc_sns[0]
+            print(f"[RotatorStage] pinned serial {serial} not found; searched and "
+                  f"using KDC101 {sn} (Thorlabs devices present: {all_sns})")
+        else:
+            sn = kdc_sns[0]
+            print(f"[RotatorStage] auto-selected KDC101 {sn} "
+                  f"(Thorlabs devices present: {all_sns})")
         try:
             dev = KCubeDCServo.CreateKCubeDCServo(sn)
         except Exception as e:  # noqa: BLE001
