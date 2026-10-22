@@ -134,7 +134,6 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
     # auto-reconnect keeps retrying even after status.acquiring flips to False.
     should_stream = camera is not None and camera.status.acquiring
     last_status_push = 0.0
-    last_temp_push = 0.0
     last_frame_time = time.time()
     last_reconnect_try = 0.0
     RECONNECT_AFTER_S = 4.0       # no frames this long while "acquiring" = link lost
@@ -195,7 +194,6 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                         except Exception:  # noqa: BLE001
                             pass
                     publish_status(frame_queue, camera.get_status())
-                    last_temp_push = time.time()
                     continue
                 if cmd_type == "load_state":
                     if hasattr(camera, "load_state"):
@@ -257,17 +255,8 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                         publish_status(frame_queue, camera.get_status())
                         last_frame_time = time.time()   # grace before next try
 
-            # Periodically read camera temperatures (serial-over-GigE) and push
-            # status. Every 5 min (first read is immediate); failures ignored.
-            now = time.time()
-            if now - last_temp_push > 300.0:
-                if hasattr(camera, "refresh_temperatures"):
-                    try:
-                        camera.refresh_temperatures()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    publish_status(frame_queue, camera.get_status())
-                last_temp_push = now
+            # Temperature is read ONLY on demand (the user's "Poll" button sends
+            # a "read_temp" command) -- no automatic periodic polling.
 
             # Pace the loop. get_frame() already blocks at the camera's native
             # frame period (RetrieveBuffer), so only sleep for the *remaining*
