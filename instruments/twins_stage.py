@@ -54,14 +54,14 @@ PM_PER_MM = 1_000_000_000        # picometres per millimetre (MCS2 linear units)
 #
 # Positions are in the CURRENT referenced coordinates (they can be negative).
 # Measure the real end points on the rig and tune these to it.
-TRAVEL_MIN_MM = -13.2           # most negative position a move may target
+TRAVEL_MIN_MM = -10.2           # most negative position a move may target
 TRAVEL_MAX_MM = 18.8            # most positive position a move may target
 
 # TWINS wedge park positions (mm). These are interferometer-specific -- tune
 # HOME/SAFE and the scan range to YOUR TWINS unit and its ZPD (see the Measure
 # tab defaults and instruments/calibration.py). Both must lie inside the travel
 # limits above; _check_travel_constants() verifies that at import.
-HOME_POSITION_MM = 0.0          # parked/working position after referencing
+HOME_POSITION_MM = -5.1        # parked/working position after referencing
 SAFE_POSITION_MM = 0.0          # parked position on disconnect
 
 # -- MCS2 motion defaults (converted to pm at connect) ------------------------
