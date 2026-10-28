@@ -40,14 +40,6 @@ from instruments import analysis as A
 from instruments.hyperspectral import (
     HyperspectralProcessor, resolve_n_points, DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM)
 
-# Stokes polarimetry panel (embedded as a toolbar-toggled page). Guarded so the
-# analyzer still starts if stokes_app.py is ever absent -- the Stokes button is
-# just omitted in that case.
-try:
-    from stokes_app import StokesApp
-except Exception:  # noqa: BLE001
-    StokesApp = None
-
 
 # ---------------------------------------------------------------------------
 # File helpers (read metadata cheaply; load cube on demand)
@@ -355,7 +347,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.phase_mode = False        # True while the phase-only page is shown
         self.phase_bkg = None          # (ref_raw_cube, ref_positions, path) background
         self.phase_bkg_on = False      # subtract the background phase (per-pixel)
-        self._stokes_dirty = True      # Stokes panel needs (re)fill from loaded folder
         self.work_roi = None           # pg.RectROI defining the analysis crop (or None)
         self._full_hw = None           # (h, w) of the FULL current frame (pre-crop)
 
@@ -370,17 +361,17 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     # -- UI -------------------------------------------------------------------
     def _build_ui(self):
-        # toolbar: exactly six controls -- Load folder | Load files | [view
-        # selector: Hypercube · Phase · Stokes] | Save/Export dropdown.
+        # toolbar: Load folder | Load files | [view selector: Hypercube · Phase]
+        # | Save/Export dropdown.
         tb = self.addToolBar("File")
         tb.setMovable(False)
         tb.addAction("Load folder…").triggered.connect(self.load_folder)
         tb.addAction("Load files…").triggered.connect(self.load_files)
         tb.addSeparator()
 
-        # View selector: three mutually-exclusive toggles picking the central page.
+        # View selector: two mutually-exclusive toggles picking the central page.
         # Exactly one is always active, so "Hypercube" is the always-available way
-        # back from the Phase / Stokes views.
+        # back from the Phase view.
         self.view_group = QtGui.QActionGroup(self)
         self.view_group.setExclusive(True)
         self.act_hyper = tb.addAction("Hypercube")
@@ -396,14 +387,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                                   "(recomputed complex DFT at the current λ).")
         self.act_phase.toggled.connect(self._toggle_phase_view)
         self.view_group.addAction(self.act_phase)
-        self.act_stokes = None
-        if StokesApp is not None:
-            self.act_stokes = tb.addAction("Stokes")
-            self.act_stokes.setCheckable(True)
-            self.act_stokes.setToolTip("Stokes polarimetry: compute S0..S3 per "
-                                       "pixel from four QWP-angle measurements.")
-            self.act_stokes.toggled.connect(self._toggle_stokes_view)
-            self.view_group.addAction(self.act_stokes)
         tb.addSeparator()
 
         # Save / Export dropdown: all saving + export actions in one menu button.
@@ -417,6 +400,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         save_menu.addAction("Export ROI vs Z…").triggered.connect(self.export_roi_vs_z)
         save_menu.addSeparator()
         save_menu.addAction("Recompute → save all Z…").triggered.connect(self.batch_recompute)
+        save_menu.addAction("Export processed cubes…").triggered.connect(self.export_processed_cubes)
         save_btn.setMenu(save_menu)
         tb.addWidget(save_btn)
 
@@ -622,6 +606,22 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         pr.addRow(b_ratio)
         pr.addRow(self.lbl_ratio)
 
+        # --- Flat-field: divide EVERY band of the current cube by that cube's own
+        #     frame at a chosen λ (Stokes-panel style). Corrects spatial
+        #     illumination; the reference frame is taken from whichever cube is
+        #     shown, so it re-derives itself for each Z/angle as you scrub.
+        self.chk_flat = QtWidgets.QCheckBox("Flat-field: ÷ frame at λ")
+        self.chk_flat.setToolTip("Divide every wavelength of the shown cube by that "
+                                 "same cube's frame at the λ below (per pixel). "
+                                 "Re-applied to each Z/angle file automatically.")
+        self.chk_flat.toggled.connect(self._on_flat_toggled)
+        self.spin_flat_wl = QtWidgets.QDoubleSpinBox()
+        self.spin_flat_wl.setRange(0.1, 100.0); self.spin_flat_wl.setDecimals(4)
+        self.spin_flat_wl.setSuffix(" µm")
+        self.spin_flat_wl.valueChanged.connect(self._on_flat_toggled)
+        pr.addRow(self.chk_flat)
+        pr.addRow("Flat-field λ", self.spin_flat_wl)
+
         self.spin_clusters = QtWidgets.QSpinBox(); self.spin_clusters.setRange(2, 16)
         self.spin_clusters.setValue(4)
         self.spin_clusters.valueChanged.connect(
@@ -697,27 +697,44 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             "Recompute map/spectra from the interferogram window (below)")
         self.chk_recompute.toggled.connect(self._toggle_recompute)
         ig.addWidget(self.chk_recompute)
-        pb = QtWidgets.QHBoxLayout()
-        for name, fn in [("Full", self._win_full), ("Centre", self._win_centre),
-                         ("Left tail", self._win_left), ("Right tail", self._win_right)]:
-            b = QtWidgets.QPushButton(name); b.clicked.connect(fn); pb.addWidget(b)
-        ig.addLayout(pb)
         form = QtWidgets.QFormLayout()
         self.r_apod = QtWidgets.QComboBox()
         # SYMMETRIC FTIR windows centred at the ZPD (no width parameter).
         self.r_apod.addItems(["happ-genzel", "blackman-harris-3",
                               "blackman-harris-4", "triangular", "boxcar"])
+        # How the apodization ZPD centre is found: one field-wide centre-burst
+        # (envelope of the signed spatial sum), or an independent I^2 barycentre
+        # per pixel (follows a ZPD that drifts across the field of view).
+        self.r_center = QtWidgets.QComboBox()
+        self.r_center.addItems(["envelope (field)", "barycentre (per-pixel)"])
+        self.r_center.setToolTip(
+            "Apodization centre:\n"
+            "• envelope (field): one ZPD for the whole frame (robust, default).\n"
+            "• barycentre (per-pixel): each pixel's own I² barycentre, so a ZPD "
+            "that varies across the field is followed per pixel.")
         self.r_wl0 = QtWidgets.QDoubleSpinBox(); self.r_wl0.setRange(0.1, 100); self.r_wl0.setSuffix(" µm")
         self.r_wl1 = QtWidgets.QDoubleSpinBox(); self.r_wl1.setRange(0.1, 100); self.r_wl1.setSuffix(" µm")
         self.r_nfreq = QtWidgets.QSpinBox(); self.r_nfreq.setRange(0, 8192)
         self.r_nfreq.setSpecialValueText("Auto")
-        for wdg in (self.r_apod, self.r_wl0, self.r_wl1, self.r_nfreq):
+        # Spatial binning (block-average NxN) applied to the raw interferogram
+        # before the DFT. The raw is saved full-resolution, so this lets you
+        # recompute the spectral hypercube at any binning (1 = full resolution).
+        self.r_bin = QtWidgets.QSpinBox(); self.r_bin.setRange(1, 32); self.r_bin.setValue(1)
+        self.r_bin.setPrefix("×")
+        self.r_bin.setToolTip(
+            "Spatial binning for recompute: block-average each raw frame NxN "
+            "before the per-pixel DFT. 1 = full spatial resolution. Higher = "
+            "coarser map, better SNR, faster.")
+        for wdg in (self.r_apod, self.r_center, self.r_wl0, self.r_wl1,
+                    self.r_nfreq, self.r_bin):
             sig = (wdg.currentTextChanged if isinstance(wdg, QtWidgets.QComboBox)
                    else wdg.valueChanged)
             sig.connect(self._recompute_if_on)
         form.addRow("Apodization", self.r_apod)
+        form.addRow("Apod. centre", self.r_center)
         form.addRow("λ from", self.r_wl0); form.addRow("λ to", self.r_wl1)
         form.addRow("N freq", self.r_nfreq)
+        form.addRow("Binning", self.r_bin)
         ig.addLayout(form)
         self.lbl_axis = QtWidgets.QLabel("")
         self.lbl_axis.setStyleSheet("font-weight:bold;")
@@ -824,8 +841,15 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         btn_phase_stack.setToolTip("Phase-correct every cube in the loaded stack with the "
                                    "background and save the phased spectrum cubes to a folder.")
         btn_phase_stack.clicked.connect(self._phase_stack_save)
+        self.chk_save_complex = QtWidgets.QCheckBox("save complex")
+        self.chk_save_complex.setToolTip(
+            "Export the COMPLEX spectrum (complex64, amplitude + phase) instead of the "
+            "magnitude/absorptive part, so phase is preserved. Applies to both "
+            "'Recompute → save all Z' and 'Phase Z×θ stack → save'. With a phase "
+            "background loaded and subtracted it saves the phased field G = F·e^{-iΦ}; "
+            "otherwise the raw complex spectrum F.")
         pb.addWidget(btn_bkg); pb.addWidget(self.chk_phase_bkg)
-        pb.addWidget(btn_phase_stack); pb.addStretch(1)
+        pb.addWidget(btn_phase_stack); pb.addWidget(self.chk_save_complex); pb.addStretch(1)
         ph.addLayout(pb)
         self.lbl_phase_bkg = QtWidgets.QLabel("Background: none loaded.")
         self.lbl_phase_bkg.setStyleSheet("color:#888;"); self.lbl_phase_bkg.setWordWrap(True)
@@ -852,11 +876,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.main_split)   # index 0
         self.stack.addWidget(self.phase_page)   # index 1
-        # Stokes page: embed the standalone StokesApp (its own self-contained UI
-        # + file loading), so the panel behaves exactly like stokes_app.py.
-        self.stokes_app = StokesApp(embedded=True) if StokesApp is not None else None
-        if self.stokes_app is not None:
-            self.stack.addWidget(self.stokes_app)   # index 2
         self.setCentralWidget(self.stack)
 
         self.statusBar().showMessage("No data — File ▸ Load folder…")
@@ -929,6 +948,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             nf = len(self.wavelengths)
             self.spin_crop0.setValue(float(self.wavelengths.min()))
             self.spin_crop1.setValue(float(self.wavelengths.max()))
+            # Flat-field reference λ default = longest wavelength (blackbody frame),
+            # matching the Stokes panel's default.
+            self.spin_flat_wl.blockSignals(True)
+            self.spin_flat_wl.setValue(float(self.wavelengths.max()))
+            self.spin_flat_wl.blockSignals(False)
             self.wl_slider.blockSignals(True)
             self.wl_slider.setMinimum(0)
             self.wl_slider.setMaximum(max(0, nf - 1)); self.wl_slider.setValue(nf // 2)
@@ -955,12 +979,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             if len(self._a_axis) > 1:
                 zr += f", {len(self._a_axis)} angles {self._a_axis[0]:.1f}…{self._a_axis[-1]:.1f}°"
             self.statusBar().showMessage(f"Loaded {len(infos)} cube(s): {zr}")
-            # A new dataset -> the Stokes panel must refill from it (lazily on next
-            # open, or right away if it is the page currently shown).
-            self._stokes_dirty = True
-            if (self.stokes_app is not None
-                    and self.stack.currentWidget() is self.stokes_app):
-                self._refresh_stokes_from_main()
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -1178,8 +1196,34 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         if wl is not None:
             self.wavelengths = wl
             self._sync_wl_slider(len(wl))
-        # sample / reference division first, then background subtraction on top.
-        return self._apply_background(self._apply_ratio(cube))
+        # flat-field (÷ own frame) first, then reference division, then bkg subtraction.
+        return self._apply_background(self._apply_ratio(self._apply_flatfield(cube)))
+
+    def _apply_flatfield(self, cube):
+        """Divide every band by the UNITARY flat = the cube's own frame at the
+        flat-field λ normalised to its peak, frame/max(frame). This corrects the
+        spatial illumination shape while preserving the absolute intensity scale
+        (÷ by a 0..1 map, peak = 1). Near-zero flat pixels -> NaN. The flat is
+        taken from the CURRENT cube, so each Z/angle file is flat-fielded against
+        its own reference frame."""
+        if (cube is None or not self.chk_flat.isChecked()
+                or self.wavelengths is None or not len(self.wavelengths)):
+            return cube
+        wl = np.asarray(self.wavelengths, float)
+        idx = int(np.argmin(np.abs(wl - self.spin_flat_wl.value())))
+        frame = cube[idx].astype(np.float32)
+        fmax = float(np.nanmax(np.abs(frame))) if frame.size else 0.0
+        if fmax <= 0:
+            return cube
+        unit = frame / fmax                          # unitary flat: peak = 1
+        safe = np.where(np.abs(unit) < 1e-6, np.nan, unit)
+        return (cube / safe[None, :, :]).astype(np.float32)
+
+    def _on_flat_toggled(self, *a):
+        # Base cube is unchanged; only the post-processing. Invalidate the ratio/bg
+        # caches (their input changed) and redraw.
+        self._bg_sig = None; self._ratio_sig = None
+        self.refresh_map(); self.update_spectra(); self._update_phase()
 
     def _apply_background(self, cube):
         """Subtract the chosen background ROI's average spectrum from every pixel.
@@ -1274,14 +1318,31 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         entry = self._raw_cache.get(self._cur())
         return bool(entry[2]) if entry else False
 
+    def _recompute_bin(self) -> int:
+        return int(self.r_bin.value()) if hasattr(self, "r_bin") else 1
+
+    def _bin_raw(self, raw):
+        """Block-average each (h, w) frame of a raw interferogram cube by the
+        recompute Binning factor. 1 = full resolution (no-op)."""
+        f = self._recompute_bin()
+        raw = np.asarray(raw)
+        if f <= 1 or raw is None or raw.ndim != 3:
+            return raw
+        n, h, w = raw.shape
+        bh, bw = h // f, w // f
+        if bh == 0 or bw == 0:
+            return raw
+        return raw[:, :bh * f, :bw * f].reshape(n, bh, f, bw, f).mean(axis=(2, 4))
+
     def _phase_ref_cube(self, shape):
         """The background reference interferogram to phase-correct against, if one
-        is loaded, phasing is enabled, and its shape matches (else None)."""
+        is loaded, phasing is enabled, and its shape matches (else None). Binned
+        by the same recompute factor so it lines up with the binned measurement."""
         if not self.phase_bkg_on or self.phase_bkg is None:
             return None
-        # Crop the (full-frame) background to the SAME analysis ROI so it matches
-        # the cropped measurement raw before its phase is subtracted.
-        ref_raw = self._work_crop3(self.phase_bkg[0])
+        # Crop the (full-frame) background to the SAME analysis ROI, then bin it
+        # the same way as the measurement raw, before its phase is subtracted.
+        ref_raw = self._bin_raw(self._work_crop3(self.phase_bkg[0]))
         return ref_raw if getattr(ref_raw, "shape", None) == tuple(shape) else None
 
     def _compute_from_raw(self, zi):
@@ -1290,6 +1351,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             return None, None
         if self.proc is None:
             self.proc = HyperspectralProcessor()
+        raw = self._bin_raw(raw)   # recompute at the chosen spatial binning
         nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
         return self.proc.compute_hyperspectral(
             pos, raw, wl_start=self.r_wl0.value(), wl_stop=self.r_wl1.value(),
@@ -1297,7 +1359,14 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             ft_window_mm=self.win_region.getRegion(),
             expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
             positions_calibrated=self.current_positions_calibrated(),
-            reference_cube=self._phase_ref_cube(raw.shape))
+            reference_cube=self._phase_ref_cube(raw.shape),
+            center_method=self._center_method())
+
+    def _center_method(self):
+        """The apodization-centre method selected in the recompute panel:
+        'barycenter' (per-pixel) or 'envelope' (field-wide, default)."""
+        return ("barycenter" if self.r_center.currentText().startswith("bary")
+                else "envelope")
 
     def _sync_wl_slider(self, nf=None):
         self._apply_wl_slider_range()
@@ -1447,36 +1516,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "This file has no stored raw interferogram — it cannot be recomputed "
                 "(re-acquire with raw saved).", 5000)
-
-    def _zpd_mm(self, pos, raw):
-        from instruments.hyperspectral import find_centerburst
-        ifg = raw.mean(axis=(1, 2))
-        idx = find_centerburst(ifg - ifg.mean(), pos, DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM)
-        return float(pos[idx])
-
-    def _set_window(self, lo, hi):
-        self.win_region.setRegion([float(lo), float(hi)])
-        self._on_window_changed()
-
-    def _win_full(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            self._set_window(pos.min(), pos.max())
-
-    def _win_centre(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            z = self._zpd_mm(pos, raw); self._set_window(z - 0.2, z + 0.2)
-
-    def _win_left(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            self._set_window(pos.min(), self._zpd_mm(pos, raw) - 0.05)
-
-    def _win_right(self):
-        pos, raw = self.current_interferogram()
-        if pos is not None:
-            self._set_window(self._zpd_mm(pos, raw) + 0.05, pos.max())
 
     def current_mask(self):
         zi = self._cur()
@@ -1879,35 +1918,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._mirror_phase_sliders()
             self._update_phase()
 
-    def _toggle_stokes_view(self, on):
-        """Show the embedded Stokes polarimetry page. On entry, (re)fill it from
-        the folder loaded in the analyzer so the user does not pick a folder
-        again."""
-        if on and self._stokes_dirty:
-            self._refresh_stokes_from_main()
-        self._show_view()
-
-    def _refresh_stokes_from_main(self):
-        """Feed the Stokes panel the .npz files currently loaded in the analyzer
-        (File ▸ Load folder), so it auto-assigns the four QWP slots by angle."""
-        if self.stokes_app is None:
-            return
-        if not self.infos:
-            self.stokes_app.status.showMessage(
-                "No dataset loaded — use File ▸ Load folder in the analyzer first.")
-            return
-        paths = list(dict.fromkeys(i["path"] for i in self.infos))   # unique, ordered
-        self.stokes_app.populate_from_paths(paths)
-        self._stokes_dirty = False
-
     def _show_view(self):
         """Pick the central page from the view toggles (Hypercube = main view)."""
         if getattr(self, "stack", None) is None:
             return                                  # toolbar built before the stack
         if self.act_phase.isChecked():
             self.stack.setCurrentWidget(self.phase_page)
-        elif self.act_stokes is not None and self.act_stokes.isChecked():
-            self.stack.setCurrentWidget(self.stokes_app)
         else:
             self.stack.setCurrentWidget(self.main_split)
 
@@ -1971,6 +1987,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.ph_info.setText("This file has no stored raw interferogram — "
                                  "the phase view is unavailable (re-acquire with raw saved).")
             return
+        raw = self._bin_raw(raw)   # match the recompute Binning setting
         idx = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
         lam = float(np.asarray(self.wavelengths)[idx])
         if self.proc is None:
@@ -1981,7 +1998,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 ft_window_mm=self.win_region.getRegion(),
                 expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                 positions_calibrated=self.current_positions_calibrated(),
-                reference_cube=self._phase_ref_cube(raw.shape))
+                reference_cube=self._phase_ref_cube(raw.shape),
+                center_method=self._center_method())
         except Exception as e:  # noqa: BLE001
             self.ph_info.setText(f"Phase compute failed: {e}")
             return
@@ -2110,11 +2128,12 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         dest = QtWidgets.QFileDialog.getExistingDirectory(self, "Save phased Z×θ stack to…")
         if not dest:
             return
-        ref_raw = self.phase_bkg[0]
+        ref_raw = self._bin_raw(self.phase_bkg[0])   # bin ref to the recompute factor
         if self.proc is None:
             self.proc = HyperspectralProcessor()
         wl0, wl1 = self.r_wl0.value(), self.r_wl1.value()
         apod = self.r_apod.currentText(); win = list(self.win_region.getRegion())
+        cmethod = self._center_method()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         saved = skipped = 0
         try:
@@ -2130,15 +2149,20 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                         "background", "background_subtracted", "saturation_mask",
                         "twins_positions_mm", "twins_positions_calibrated_mm")
                         if key in d.files}
-                if raw is None or pos is None or ref_raw.shape != raw.shape:
+                if raw is None or pos is None:
+                    skipped += 1
+                    continue
+                raw_b = self._bin_raw(raw)     # bin for the DFT; raw saved full-res
+                if getattr(ref_raw, "shape", None) != raw_b.shape:
                     skipped += 1
                     continue
                 nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
+                complex_out = self.chk_save_complex.isChecked()
                 wl, cube = self.proc.compute_hyperspectral(
-                    pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
+                    pos, raw_b, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
                     search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
-                    reference_cube=ref_raw)
+                    reference_cube=ref_raw, center_method=cmethod, complex_out=complex_out)
                 if cube is None:
                     skipped += 1
                     continue
@@ -2146,8 +2170,11 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 meta.update(phase_corrected=True,
                             phase_background=os.path.basename(self.phase_bkg[2]),
                             recompute_window_mm=win, recompute_apod=apod,
-                            recompute_nfreq=int(nfreq))
-                kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
+                            recompute_nfreq=int(nfreq), complex_spectrum=bool(complex_out),
+                            raw_binning=1, spectrum_binning=self._recompute_bin())
+                # complex64 keeps phase; else the real absorptive part as before.
+                sc = cube.astype(np.complex64) if complex_out else cube.astype(np.float32)
+                kw = dict(wavelengths=wl, spectrum_cube=sc,
                           raw_interferogram=np.asarray(raw, np.float32),
                           metadata=np.array(meta, dtype=object),
                           metadata_json=json.dumps(meta, default=str, indent=2))
@@ -2480,8 +2507,17 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         win = list(self.win_region.getRegion())
         wl0, wl1, nfset = self.r_wl0.value(), self.r_wl1.value(), self.r_nfreq.value()
         apod = self.r_apod.currentText()
+        cmethod = self._center_method()
         if self.proc is None:
             self.proc = HyperspectralProcessor()
+        # "save complex" -> export the full complex spectrum (complex64) instead of
+        # the magnitude. If a phase background is loaded AND its subtraction is on,
+        # export the phased field G = F·e^{-iΦ} (matches the display); otherwise the
+        # raw complex spectrum F (instrument phase included).
+        complex_out = self.chk_save_complex.isChecked()
+        ref_raw = None
+        if complex_out and self.phase_bkg is not None and self.phase_bkg_on:
+            ref_raw = self._bin_raw(self.phase_bkg[0])
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         saved = 0
         try:
@@ -2503,22 +2539,103 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                 if pos is None or raw is None:
                     continue
                 nfreq = resolve_n_points(len(pos), manual=nfset)
+                raw_b = self._bin_raw(raw)     # recompute at the chosen binning
+                # use the background phase only if it matches this cube's geometry
+                ref = ref_raw if (ref_raw is not None
+                                  and getattr(ref_raw, "shape", None) == raw_b.shape) else None
                 wl, cube = self.proc.compute_hyperspectral(
-                    pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
+                    pos, raw_b, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
                     ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
-                    search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated)
+                    search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
+                    reference_cube=ref, center_method=cmethod, complex_out=complex_out)
                 meta.update(recompute_window_mm=win, recompute_apod=apod,
-                            recompute_wl_um=[wl0, wl1], recompute_nfreq=int(nfreq))
-                kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
+                            recompute_wl_um=[wl0, wl1], recompute_nfreq=int(nfreq),
+                            recompute_center=cmethod, complex_spectrum=bool(complex_out),
+                            phase_corrected=bool(ref is not None),
+                            raw_binning=1, spectrum_binning=self._recompute_bin())
+                # complex64 keeps phase; else magnitude float32 as before.
+                sc = cube.astype(np.complex64) if complex_out else cube.astype(np.float32)
+                kw = dict(wavelengths=wl, spectrum_cube=sc,
                           z_value_mm=info["z"], z_unit="mm",
                           metadata=np.array(meta, dtype=object),
                           metadata_json=json.dumps(meta, default=str, indent=2))
-                if mask is not None:
+                # Keep the saturation mask only if it still matches the (possibly
+                # binned) spectrum geometry; otherwise it no longer applies.
+                if mask is not None and getattr(mask, "shape", None) == cube.shape[1:]:
                     kw["saturation_mask"] = np.asarray(mask, bool)
                 base = os.path.splitext(os.path.basename(info["path"]))[0]
                 np.savez(os.path.join(out, base + "_rewin.npz"), **kw)  # uncompressed: fast write
                 saved += 1
             self.statusBar().showMessage(f"recomputed + saved {saved} position(s) to {out}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _processed_cube(self, zi):
+        """(wl, cube) for file `zi` with the CURRENT Process settings applied
+        (ROI crop, SVD, flat-field, reference division, background ROI) -- i.e.
+        exactly what the maps show, computed from the loaded spectrum cube."""
+        wl = self.infos[zi].get("wavelengths")
+        wl = np.asarray(wl) if wl is not None else self._saved_wavelengths
+        cube = _load_cube(self.infos[zi]["path"], self.infos[zi].get("map_index"))
+        if cube is None:
+            return (np.asarray(wl) if wl is not None else None), None
+        cube = self._work_crop3(cube)
+        if self.chk_svd.isChecked():
+            cube = A.svd_denoise(cube, self.spin_k.value())
+        old = self.wavelengths                       # flat-field/ratio use self.wavelengths
+        self.wavelengths = np.asarray(wl) if wl is not None else old
+        try:
+            out = self._apply_background(self._apply_ratio(self._apply_flatfield(cube)))
+        finally:
+            self.wavelengths = old
+        return (np.asarray(wl) if wl is not None else None), out
+
+    def export_processed_cubes(self):
+        """Save every loaded file as a new .npz with the current Process settings
+        (flat-field, reference division, background ROI, SVD) baked into the
+        spectrum cube -- one output per input file, same z/angle + metadata."""
+        if not self.infos:
+            self.statusBar().showMessage("Load a dataset first."); return
+        if self.recompute_on:
+            self.statusBar().showMessage(
+                "Turn off 'Recompute' to export processed spectrum cubes.", 6000); return
+        out = QtWidgets.QFileDialog.getExistingDirectory(self, "Save processed cubes to…")
+        if not out:
+            return
+        proc = dict(flat_field=bool(self.chk_flat.isChecked()),
+                    flat_field_wl_um=(self.spin_flat_wl.value()
+                                      if self.chk_flat.isChecked() else None),
+                    divide_by_reference=bool(self.chk_ratio.isChecked()
+                                             and self.ref_cube_full is not None),
+                    reference=self.ref_cube_name,
+                    background_roi=bool(self.chk_bg.isChecked()),
+                    svd_k=(self.spin_k.value() if self.chk_svd.isChecked() else None),
+                    roi=bool(self.chk_work.isChecked()))
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        saved = 0
+        try:
+            for k, info in enumerate(self.infos):
+                self.statusBar().showMessage(f"processing {k+1}/{len(self.infos)}…")
+                QtWidgets.QApplication.processEvents()
+                wl, cube = self._processed_cube(k)
+                if cube is None:
+                    continue
+                meta = dict(info.get("metadata", {}) or {})
+                meta["processing"] = proc
+                kw = dict(spectrum_cube=np.asarray(cube, np.float32),
+                          metadata=np.array(meta, dtype=object),
+                          metadata_json=json.dumps(meta, default=str, indent=2))
+                if wl is not None:
+                    kw["wavelengths"] = np.asarray(wl)
+                if info.get("z") is not None:
+                    kw["z_value_mm"] = info["z"]; kw["z_unit"] = "mm"
+                ang = (info.get("metadata", {}) or {}).get("angle_value_deg")
+                if ang is not None:
+                    kw["angle_value_deg"] = ang
+                base = os.path.splitext(os.path.basename(info["path"]))[0]
+                np.savez(os.path.join(out, base + "_proc.npz"), **kw)
+                saved += 1
+            self.statusBar().showMessage(f"saved {saved} processed cube(s) to {out}")
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
 
