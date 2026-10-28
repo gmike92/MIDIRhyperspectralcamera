@@ -9,6 +9,7 @@ from multiprocessing import shared_memory
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLineEdit,
     QScrollArea,
+    QSplitter,
     QTabWidget,
     QSpinBox,
     QVBoxLayout,
@@ -54,7 +56,7 @@ class MainWindow(QMainWindow):
             self.shared_frame = np.ndarray(self.shared_frame_shape, dtype=np.uint16, buffer=self.shared_frame_handle.buf)
 
         self.setWindowTitle("Hyperspectral Camera — Hamamatsu Orca + TWINS (SmarAct MCS2)")
-        self.resize(1280, 820)
+        self._fit_to_screen(1280, 820)
 
         self.background_frame = None
         self.use_bg_subtraction = False
@@ -89,8 +91,9 @@ class MainWindow(QMainWindow):
         self.stages_panel = StagesPanel()
 
         controls_tabs = QTabWidget()
-        controls_tabs.setMinimumWidth(320)
-        controls_tabs.setMaximumWidth(340)
+        # No maximum width: the splitter below lets the user widen this column,
+        # so wide tabs (Measure) are reachable on a small screen.
+        controls_tabs.setMinimumWidth(240)
         controls_tabs.addTab(self._make_tab([
             self._build_camera_group(),
             self._build_processing_group(),
@@ -120,10 +123,26 @@ class MainWindow(QMainWindow):
             meta_provider=self._hyperspectral_metadata,
             save_dir=self.save_dir)
         controls_tabs.addTab(self._make_tab([self.measure_panel]), "Measure")
-        root.addWidget(controls_tabs, 0)
+        # Draggable divider between the controls and the live view: grab the bar
+        # and pull it right to read a panel that does not fit, left to give the
+        # image more room. The viewer takes all the extra space on resize.
+        self.controls_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.controls_splitter.addWidget(controls_tabs)
 
-        viewer_column = QVBoxLayout()
-        root.addLayout(viewer_column, 1)
+        viewer_panel = QWidget()
+        viewer_column = QVBoxLayout(viewer_panel)
+        viewer_column.setContentsMargins(0, 0, 0, 0)
+        self.controls_splitter.addWidget(viewer_panel)
+        self.controls_splitter.setStretchFactor(0, 0)
+        self.controls_splitter.setStretchFactor(1, 1)
+        self.controls_splitter.setChildrenCollapsible(False)
+        self.controls_splitter.setHandleWidth(8)
+        # Starting split as a fraction of the actual window width (which
+        # _fit_to_screen may have shrunk), clamped so the controls are neither
+        # unusably narrow on a laptop nor wasteful on a large monitor.
+        ctrl_w = max(280, min(360, int(self.width() * 0.28)))
+        self.controls_splitter.setSizes([ctrl_w, max(320, self.width() - ctrl_w)])
+        root.addWidget(self.controls_splitter)
 
         title = QLabel("Camera Viewer")
         title.setStyleSheet("font-size: 20px; font-weight: 600;")
@@ -244,6 +263,26 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.fps_label)
         self.apply_color_map(self.color_map_combo.currentText())
 
+    def _fit_to_screen(self, pref_w: int, pref_h: int) -> None:
+        """Open at `pref_w` x `pref_h`, shrunk to fit whatever screen we are on.
+
+        The app runs on several machines (lab PC, laptops) and the preferred size
+        is larger than some of their screens -- without this the bottom of the
+        window, including the controls' scrollbars and the status bar, lands
+        off-screen where it cannot be reached. A margin is left for the taskbar
+        and window frame, and the window is centred on the available area.
+        """
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:                      # no display info: keep the default
+            self.resize(pref_w, pref_h)
+            return
+        avail = screen.availableGeometry()      # excludes taskbar / docks
+        w = min(pref_w, max(640, avail.width() - 40))
+        h = min(pref_h, max(480, avail.height() - 80))
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2,
+                  avail.y() + (avail.height() - h) // 3)
+
     def _make_tab(self, groups: list[QWidget]) -> QScrollArea:
         """Stack the given group widgets vertically inside a scrollable tab."""
         container = QWidget()
@@ -256,7 +295,10 @@ class MainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # AsNeeded, not AlwaysOff: when the column is dragged narrower than a
+        # panel's own minimum width, scrolling keeps the right-hand side of the
+        # controls reachable instead of clipping it.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(container)
         return scroll
 
