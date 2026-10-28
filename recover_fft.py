@@ -75,8 +75,6 @@ def recover_file(path, dest_dir, proc):
     wl0 = _f(meta.get("wl_start_um"), 3.8)
     wl1 = _f(meta.get("wl_stop_um"), 4.4)
     apod_type = str(meta.get("apodization", "happ-genzel"))
-    ft_region = str(meta.get("ft_region", "full"))
-    ft_width = _f(meta.get("ft_width_mm"), 0.1)
     nfreq_set = int(meta.get("n_freq_setting", 0) or 0)
     n_freq = resolve_n_points(len(positions), manual=nfreq_set)
 
@@ -104,8 +102,7 @@ def recover_file(path, dest_dir, proc):
         positions, dcb, wl_start=wl0, wl_stop=wl1,
         n_freq=n_freq,
         expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-        apod_type=apod_type,
-        ft_region=ft_region, ft_width_mm=ft_width)
+        apod_type=apod_type)
     if cube is None:
         return "FAILED (compute returned None)"
     if meta.get("svd_denoise"):

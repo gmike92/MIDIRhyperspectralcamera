@@ -549,7 +549,6 @@ class MeasurePanel(QWidget):
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
         self.combo_apod.currentTextChanged.connect(self._save_settings)
-        self.combo_ftregion.currentTextChanged.connect(self._save_settings)
         self.combo_save.currentTextChanged.connect(self._save_settings)
         self.chk_save_raw.toggled.connect(self._save_settings)
         for chk in self._persisted_checks().values():   # sat, zscan, zones
@@ -630,22 +629,6 @@ class MeasurePanel(QWidget):
         grid.addWidget(QLabel("Resolution"), 6, 0); grid.addWidget(self.lbl_resolution, 6, 1)
         grid.addWidget(QLabel("Max step (5/cyc)"), 7, 0); grid.addWidget(self.lbl_min_step, 7, 1)
 
-        # FT window: which part of the interferogram to transform.
-        self.combo_ftregion = QComboBox()
-        self.combo_ftregion.addItems(["full", "center", "tails"])
-        self.combo_ftregion.setToolTip(
-            "Which part of the interferogram to Fourier-transform (relative to ZPD):\n"
-            "  full   = whole interferogram\n"
-            "  center = burst only (±width) -> broad spectral features\n"
-            "  tails  = wings only (beyond ±width) -> high-Q narrow resonances")
-        self.spin_ftwidth = QDoubleSpinBox()
-        self.spin_ftwidth.setRange(0.001, 50.0); self.spin_ftwidth.setDecimals(3)
-        self.spin_ftwidth.setSingleStep(0.01); self.spin_ftwidth.setValue(0.10)
-        self.spin_ftwidth.setSuffix(" mm")
-        self.spin_ftwidth.setToolTip("Half-width around ZPD separating center from tails.")
-        grid.addWidget(QLabel("FT region"), 8, 0); grid.addWidget(self.combo_ftregion, 8, 1)
-        grid.addWidget(QLabel("FT width (±ZPD)"), 9, 0); grid.addWidget(self.spin_ftwidth, 9, 1)
-
         # Apodization ZPD centre: an independent I² barycentre per pixel (DEFAULT
         # -- follows a zero-path position that varies across the field of view),
         # or one field-wide envelope centre-burst (signed spatial sum).
@@ -657,7 +640,7 @@ class MeasurePanel(QWidget):
             "  barycentre (per-pixel) = each pixel's own I² centroid (default)\n"
             "  envelope (field)       = one centre-burst for the whole frame")
         self.combo_center.currentTextChanged.connect(self._save_settings)
-        grid.addWidget(QLabel("Apod centre"), 10, 0); grid.addWidget(self.combo_center, 10, 1)
+        grid.addWidget(QLabel("Apod centre"), 8, 0); grid.addWidget(self.combo_center, 8, 1)
         return g
 
     def _center_method(self) -> str:
@@ -824,8 +807,8 @@ class MeasurePanel(QWidget):
         self.btn_recompute = QPushButton("Recompute")
         self.btn_recompute.clicked.connect(self._recompute)
         self.btn_recompute.setToolTip("Re-run the DFT on the LAST scan's raw "
-                                      "interferogram with the current settings (FT region, "
-                                      "apodization, λ, denoise) -- no re-scan.")
+                                      "interferogram with the current settings "
+                                      "(apodization, λ, denoise) -- no re-scan.")
         self.btn_view = QPushButton("Open Viewer"); self.btn_view.clicked.connect(self._open_viewer)
         self.btn_load = QPushButton("Load"); self.btn_load.clicked.connect(self._load)
         self.btn_load.setToolTip("Open a saved hyperspectral .npz in the viewer.")
@@ -949,7 +932,6 @@ class MeasurePanel(QWidget):
             "ks_wl1": (self.spin_wl1, float),
             "ks_nfreq": (self.spin_nfreq, int),
             "ks_sat_level": (self.spin_sat, int),
-            "ks_ftwidth": (self.spin_ftwidth, float),
         }
 
     def _persisted_checks(self) -> dict:
@@ -995,9 +977,6 @@ class MeasurePanel(QWidget):
         apod = self._settings.value("ks_apod_type", None)
         if apod is not None:
             self.combo_apod.setCurrentText(str(apod))
-        ftr = self._settings.value("ks_ftregion", None)
-        if ftr is not None:
-            self.combo_ftregion.setCurrentText(str(ftr))
         ctr = self._settings.value("ks_apod_center", None)
         if ctr is not None:
             self.combo_center.setCurrentText(str(ctr))
@@ -1019,7 +998,6 @@ class MeasurePanel(QWidget):
         for key, (widget, _cast) in self._persisted_spins().items():
             self._settings.setValue(key, widget.value())
         self._settings.setValue("ks_apod_type", self.combo_apod.currentText())
-        self._settings.setValue("ks_ftregion", self.combo_ftregion.currentText())
         self._settings.setValue("ks_apod_center", self.combo_center.currentText())
         self._settings.setValue("ks_save_mode", self.combo_save.currentText())
         for key, chk in self._persisted_checks().items():
@@ -1152,7 +1130,6 @@ class MeasurePanel(QWidget):
             wl1=self.spin_wl1.value(), nfreq=self.spin_nfreq.value(),
             background=bg, bg_subtract=bool(bg_sub and bg is not None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
             center_method=self._center_method(),
             zscan=zscan, z_targets=z_targets,
             ascan=ascan, a_targets=a_targets,
@@ -1173,7 +1150,6 @@ class MeasurePanel(QWidget):
             n_freq_setting=params["nfreq"], expected_zpd_mm=DEFAULT_ZPD_MM,
             background_subtracted=params["bg_subtract"],
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
-            ft_region=params["ft_region"], ft_width_mm=params["ft_width"],
             apod_center=params["center_method"],
             zscan=zscan, filename=self.edit_filename.text().strip() or "hyperspectral",
             z_n_positions=len(z_targets), z_positions_mm=list(z_targets),
@@ -1270,8 +1246,8 @@ class MeasurePanel(QWidget):
 
     def _recompute(self) -> None:
         """Re-run the DFT on the last scan's RAW interferogram with the current
-        settings (FT region, apodization, λ) -- no re-scan. Lets you
-        compare e.g. center vs tails on already-acquired data."""
+        settings (apodization, λ, N-freq) -- no re-scan. Lets you
+        re-process already-acquired data."""
         if not getattr(self, "raw_cubes", None):
             self.lbl_status.setText("no raw data to recompute -- run a scan first")
             return
@@ -1280,19 +1256,17 @@ class MeasurePanel(QWidget):
             nfreq=self.spin_nfreq.value(),
             apod_type=self.combo_apod.currentText(),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
             center_method=self._center_method(),
         )
         # Keep the saved metadata in step with what was recomputed.
         self._scan_meta.update(
-            ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
             apodization=p["apod_type"],
             wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
             apod_center=p["center_method"], recomputed=True)
         self._per_position_saved = False   # recompute result is saved as one set
         self.btn_run.setEnabled(False)
         self.btn_recompute.setEnabled(False)
-        self.lbl_status.setText(f"recomputing from raw (FT={p['ft_region']})...")
+        self.lbl_status.setText("recomputing from raw...")
         threading.Thread(target=self._recompute_worker, args=(p,), daemon=True).start()
 
     def _recompute_worker(self, p: dict) -> None:
@@ -1314,7 +1288,6 @@ class MeasurePanel(QWidget):
                     n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"],
-                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
                     center_method=p["center_method"])
                 if cube is None:
                     continue
@@ -1573,7 +1546,6 @@ class MeasurePanel(QWidget):
                     n_freq=n_freq,
                     expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"],
-                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
                     center_method=p["center_method"])
                 if cube is None:
                     continue

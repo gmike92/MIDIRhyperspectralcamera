@@ -229,7 +229,7 @@ class HyperspectralProcessor:
                                n_freq=200, reference_cube=None,
                                expected_zero_mm=None, search_mm=None,
                                apod_type="happ-genzel",
-                               ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
+                               ft_window_mm=None,
                                positions_calibrated=False, center_method="envelope",
                                complex_out=False):
         """
@@ -320,11 +320,9 @@ class HyperspectralProcessor:
                 apod = apodization_window_map(apod_type, len(c_pos), center)
 
             # FT-window: which part of the interferogram to transform.
-            #   center -> broad spectral features (low resolution)
-            #   tails  -> high-Q narrow resonances (drop the centerburst)
-            # ft_window_mm=(lo,hi) gives an explicit position window (overrides
-            # ft_region); keep the apodization taper if the window contains the
-            # ZPD, else use a plain boxcar so a tail window isn't suppressed.
+            # ft_window_mm=(lo,hi) is an explicit position window; keep the
+            # apodization taper if the window contains the ZPD, else use a plain
+            # boxcar so a window on the wings isn't suppressed.
             if ft_window_mm is not None:
                 lo, hi = sorted(float(v) for v in ft_window_mm)
                 inwin = (c_pos >= lo) & (c_pos <= hi)
@@ -334,13 +332,6 @@ class HyperspectralProcessor:
                     in_c = (cpos_c >= lo) & (cpos_c <= hi)          # (h, w)
                     box = np.broadcast_to(inwin[:, None, None].astype(float), apod.shape)
                     apod = np.where(in_c[None], apod * inwin[:, None, None], box)
-            elif ft_region and str(ft_region).lower() != "full":
-                delta = (np.abs(c_pos - cpos_c) if scalar
-                         else np.abs(c_pos[:, None, None] - cpos_c[None]))
-                if str(ft_region).lower() == "center":
-                    apod = apod * (delta <= ft_width_mm)
-                else:  # "tails": keep the wings, drop the ZPD-centered taper
-                    apod = (delta > ft_width_mm).astype(float)
             apod3 = apod[:, np.newaxis, np.newaxis] if apod.ndim == 1 else apod
             return sig * apod3, center, c_pos
 
