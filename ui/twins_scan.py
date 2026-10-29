@@ -119,7 +119,7 @@ class TwinsScanPanel(QWidget):
         grid.addWidget(self.spin_stop, 1, 1)
 
         self.spin_steps = QSpinBox()
-        self.spin_steps.setRange(2, 10000)
+        self.spin_steps.setRange(2, 1000000)
         self.spin_steps.setValue(DEFAULT_N_STEPS)
         self.spin_steps.valueChanged.connect(self._update_step)
         grid.addWidget(QLabel("Steps"), 2, 0)
@@ -225,7 +225,7 @@ class TwinsScanPanel(QWidget):
         n = self.spin_steps.value()
         if n > 1:
             step_um = abs(self.spin_stop.value() - self.spin_start.value()) / (n - 1) * 1000
-            self.lbl_step.setText(f"{step_um:.1f} µm")
+            self.lbl_step.setText(f"{step_um:.3g} µm")
         else:
             self.lbl_step.setText("-- µm")
 

@@ -573,7 +573,7 @@ class MeasurePanel(QWidget):
         grid = QGridLayout(g)
         self.spin_start = self._mm_spin(DEFAULT_START_MM)
         self.spin_stop = self._mm_spin(DEFAULT_STOP_MM)
-        self.spin_steps = QSpinBox(); self.spin_steps.setRange(3, 10000)
+        self.spin_steps = QSpinBox(); self.spin_steps.setRange(3, 1000000)
         self.spin_steps.setValue(DEFAULT_N_STEPS)
         for s in (self.spin_start, self.spin_stop, self.spin_steps):
             s.valueChanged.connect(self._update_step)
@@ -1011,7 +1011,7 @@ class MeasurePanel(QWidget):
         step_um = None
         if n > 1:
             step_um = abs(stop - start) / (n - 1) * 1000
-            self.lbl_step.setText(f"{step_um:.1f} µm")
+            self.lbl_step.setText(f"{step_um:.3g} µm")
         else:
             self.lbl_step.setText("-- µm")
         # Show what "Auto" resolves to (interpolation bins), so the readout
