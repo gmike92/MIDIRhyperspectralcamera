@@ -6,10 +6,8 @@ Workflow
 Load the THREE measurement hypercubes (.npz saved by the acquisition app, each
 carrying a `raw_interferogram` + position axis + `wavelengths`) as M1, M2, M3,
 and optionally a FOURTH hypercube used only for the phasing (background phase
-correction). Pick a wavelength with the slider; the app then does exactly what
-the analysis_app Phase panel does -- a per-pixel complex DFT at that wavelength
-(same apodization / ZPD / FT-window / phase-reference machinery via
-HyperspectralProcessor.compute_complex_map) -- and shows, in a 3x3 grid:
+correction). Pick a wavelength with the slider; the app does a per-pixel complex DFT 
+at that wavelength -- and shows, in a 3x3 grid:
 
     row 1 : amplitude |field|   for M1, M2, M3
     row 2 : phase (rad)         for M1, M2, M3   (colour scale labelled in pi)
@@ -20,7 +18,7 @@ HyperspectralProcessor.compute_complex_map) -- and shows, in a 3x3 grid:
       S3^2 = 1/2 (M1^2 + M2^2 - M3^2)
 
 |S_i| = sqrt(clip(S_i^2, 0)). By default the SIGNED parameters are shown:
-|S_i| times a per-pixel sign  sgn(M2+phi3), sgn(M1+M3), sgn(phi1-phi2).
+|S_i| times a per-pixel sign  sign(cos(P2)), sign(cos(P1)), sign(sin(P1)).
 
 Run:  gui/.venv/Scripts/python stokes_maps_app.py
 """
@@ -139,9 +137,9 @@ def _nanmax_safe(a, default=1.0):
 # |S_i| = sqrt(clip(S_i^2, 0)); the SIGNED value multiplies it by a per-pixel
 # sign taken from the expressions the user specified.
 TITLES_SIGNED = [
-    "S₁ = sgn(M₂+φ₃)·√[½(M₂² + M₃² − M₁²)]",
-    "S₂ = sgn(M₁+M₃)·√[½(M₁² + M₃² − M₂²)]",
-    "S₃ = sgn(φ₁−φ₂)·√[½(M₁² + M₂² − M₃²)]",
+    "S₁ = sgn(cos(φ₂))·√[½(M₂² + M₃² − M₁²)]",
+    "S₂ = sgn(cos(φ₁))·√[½(M₁² + M₃² − M₂²)]",
+    "S₃ = sgn(sin(φ₁))·√[½(M₁² + M₂² − M₃²)]",
 ]
 TITLES_UNSIGNED = [
     "|S₁| = √[½(M₂² + M₃² − M₁²)]",
@@ -202,6 +200,49 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         b_export.clicked.connect(self._open_export_dialog)
         top.addWidget(b_export)
         root.addLayout(top)
+
+        # --- transmission-correction row ---
+        # Per-cube scalar gain: the measurements are taken through different
+        # optics/polarisers, so their |field| maps are not directly comparable
+        # until each is divided by its own transmission. M1 is the normalisation
+        # reference and stays at 1 -- correcting the other cubes relative to it
+        # is equivalent to correcting all four.
+        trow = QtWidgets.QHBoxLayout()
+        trow.addWidget(QtWidgets.QLabel("Transmission correction"))
+        self.sp_gain = {}
+        for key, label, tip in (
+            (1, "M₂",
+             "Multiply the M₂ complex map by this factor (amplitude and every "
+             "Stokes map that uses it; the phase is unchanged by a positive "
+             "scalar)."),
+            (2, "M₃",
+             "Multiply the M₃ complex map by this factor (amplitude and every "
+             "Stokes map that uses it; the phase is unchanged by a positive "
+             "scalar)."),
+            ("ref", "phasing ref",
+             "Multiply the phasing-reference complex map by this factor. This "
+             "matters only while 'I₄₅ from' = phasing ref, i.e. when that cube is "
+             "the normalisation source for S₀ = 2·I₄₅ − S₂ and for the amplitude "
+             "mask." + chr(10) +
+             "The phasing itself is NOT affected: the reference enters as "
+             "exp(-i·angle(ref)), a unit-modulus phasor, so any positive scalar "
+             "cancels exactly."),
+            ("i45", "I₄₅ cube",
+             "Multiply the separate I₄₅ cube's complex map by this factor. Used "
+             "only while 'I₄₅ from' = separate cube."),
+        ):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setRange(1e-6, 1e4); s.setDecimals(4)
+            s.setSingleStep(0.01); s.setValue(1.0)
+            s.setToolTip(tip)
+            s.valueChanged.connect(self._schedule)
+            trow.addWidget(QtWidgets.QLabel(label)); trow.addWidget(s)
+            self.sp_gain[key] = s
+        self.lbl_m1_fixed = QtWidgets.QLabel("(M₁ ≡ 1, reference)")
+        self.lbl_m1_fixed.setStyleSheet("color:#888;")
+        trow.addWidget(self.lbl_m1_fixed)
+        trow.addStretch(1)
+        root.addLayout(trow)
 
         # --- S0 / normalisation row ---
         s0row = QtWidgets.QHBoxLayout()
@@ -444,6 +485,21 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         """The cube whose |field| is I45: the phasing ref or the separate cube."""
         return self.ref if self.combo_i45src.currentIndex() == 0 else self.i45
 
+    def _gain(self, key):
+        """User transmission-correction factor for one cube (1.0 if there is none).
+
+        `key` is 0/1/2 for M1/M2/M3, "ref" for the phasing reference or "i45" for
+        the separate I45 cube. M1 carries no box -- it is the normalisation
+        reference. Applied to the COMPLEX map: the DFT is linear, so scaling the
+        map equals scaling the raw interferogram, without copying the cube.
+        """
+        s = self.sp_gain.get(key)
+        return 1.0 if s is None else float(s.value())
+
+    def _i45_gain(self):
+        """Gain of whichever cube currently feeds I45."""
+        return self._gain("ref" if self.combo_i45src.currentIndex() == 0 else "i45")
+
     def _recompute(self, *args):
         lam = self._current_lambda()
         if lam is None:
@@ -483,6 +539,7 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             except Exception as e:  # noqa: BLE001
                 c45 = None; notes.append(f"I₄₅: {e}")
             if c45 is not None:
+                c45 = c45 * self._i45_gain()
                 self._i45_amp = np.abs(c45).astype(np.float64)
                 i45_ph = np.angle(c45).astype(np.float64)
                 pk = _robust_peak(self._i45_amp)
@@ -523,6 +580,9 @@ class StokesMapsApp(QtWidgets.QMainWindow):
             if cmap is None:
                 notes.append(f"M{k+1}: too few scan positions for a DFT")
                 prepared.append(None); continue
+            g = self._gain(k)                 # M1 has no box -> 1.0 (reference)
+            if g != 1.0:
+                cmap = cmap * g
             amp = np.abs(cmap).astype(np.float64)
             phase = np.angle(cmap).astype(np.float64)
             # Mask from I45 when available (single mask), else this map's own peak.
@@ -541,7 +601,9 @@ class StokesMapsApp(QtWidgets.QMainWindow):
                                     autoLevels=False, levels=(-np.pi, np.pi))
             self.ph_cbar[k].setLevels((-np.pi, np.pi)); _set_pi_ticks(self.ph_cbar[k])
             self.amp_title[k].setText(
-                f"M{k+1}  |field|" + ("  [phased]" if ref_raw is not None else ""))
+                f"M{k+1}  |field|"
+                + (f"  ×{g:g}" if g != 1.0 else "")
+                + ("  [phased]" if ref_raw is not None else ""))
             prepared.append((amp, valid, phase))
 
         self._prepared = prepared
@@ -550,6 +612,14 @@ class StokesMapsApp(QtWidgets.QMainWindow):
         base = (f"λ = {lam:.4f} µm   |   apod {apod}   |   centre {center}   |   "
                 f"{n_loaded}/3 maps"
                 + ("   |   phasing ON" if phasing else ""))
+        # Make a non-unity transmission correction visible: a scaled map must
+        # never be mistaken for a raw one.
+        gains = [("M₂", self._gain(1)), ("M₃", self._gain(2))]
+        if src is not None:
+            gains.append(("I₄₅", self._i45_gain()))
+        active = [f"{lbl}×{g:g}" for lbl, g in gains if g != 1.0]
+        if active:
+            base += "   |   gain " + " ".join(active)
         if notes:
             base += "   |   " + "; ".join(notes)
         self._status_base = base
