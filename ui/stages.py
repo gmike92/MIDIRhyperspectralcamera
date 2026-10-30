@@ -32,16 +32,16 @@ from instruments.twins_stage import TwinsStage, TRAVEL_MIN_MM, TRAVEL_MAX_MM
 # are only the FIRST-RUN defaults: the serial typed in the panel is remembered
 # per PC (QSettings "MIR_CAMERA/Stages", same store as the other panels) and
 # restored at the next start. An empty serial means "first free Thorlabs
-# device" (the other motors' and the rotator's serials are excluded).
+# device" (the other motors' serials and OTHER_KINESIS_SERIALS are excluded).
 THORLABS_MOTORS = [
     ("Motor 1", ""),
     ("Motor 2", ""),
     ("Motor 3", ""),
 ]
 THORLABS_STAGE_NAME = "MTS50-Z8"
-# Other Thorlabs K-Cubes that may be plugged into this PC (e.g. the PRM1-Z8
-# rotator's KDC101): never auto-picked for a motor.
-OTHER_KINESIS_SERIALS = ["27267060"]
+# Other Thorlabs K-Cubes that may be plugged into this PC (not driven by this
+# app): never auto-picked for a motor.
+OTHER_KINESIS_SERIALS: list = []
 
 
 class StageController(QtCore.QObject):

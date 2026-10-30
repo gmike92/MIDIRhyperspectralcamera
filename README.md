@@ -56,17 +56,20 @@ controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
 - FPGA/board + FPA temperature readout (serial-over-GigE), NUC/BPR correction.
 
 **Stages**
-- **Thorlabs Stage** (delay, mm) and **Rotator** (deg) tabs — connect / home /
-  go-to / jog, each with a no-hardware "Simulate" mode.
+- **Thorlabs Motors** tab: three MTS50-Z8 stages on KDC101 K-Cubes (told apart by
+  serial number, remembered per PC) — connect / home / go-to / jog, each with a
+  no-hardware "Simulate" mode.
 - **TWINS** (SmarAct SCU3D wedge) tab with a live 1-D interferogram scan.
 
-**Hyperspectral measurement (Measure tab)**
-- Steps the TWINS wedge, grabs frame stacks, computes a **per-pixel DFT** →
-  spectral cube, motor-nonlinearity calibrated, auto-saved per position.
-- **Z-scan** and **angle-scan**, each specified as up to three enable-able
-  **zones** (independent spacing), acquired as a nested **Z × angle grid**.
-- Built-in **HyperViewer**: λ-scrub / peak-λ / peak-intensity / SAM /
-  **continuum-line** maps, per-pixel spectra, colormaps.
+**Extended-resolution measurement (Measure tab)**
+- Scans the TWINS wedge once per **motor configuration**: each of the three
+  Thorlabs motors has an *Out* (optic clear of the beam) and an *In* (z1/z2/z3)
+  position, defined once and remembered; seven configurations (none, M1, M2,
+  M3, M1+M3, M2+M3, M1+M2+M3) are acquired in order.
+- Every configuration is saved as its own `.npz` (raw interferogram cube,
+  measured wedge positions, motor positions, metadata) as soon as it finishes.
+- **HyperViewer** (`view_hyperspectral.py`): λ-scrub / peak-λ / peak-intensity /
+  SAM / **continuum-line** maps, per-pixel spectra, colormaps, for saved cubes.
 
 **Analysis**
 - A standalone Z-series analyzer (`analysis_app.py`) and a lightweight cube
@@ -87,12 +90,12 @@ controllers, can be scanned to acquire a hypercube at every (Z, angle) point.
     factory.py            create_camera(mode)
   ui/
     main_window.py        orchestrator: live view, controls, background, ROI, save
-    stages.py             delay + rotator + TWINS control panels
+    stages.py             Thorlabs motors + TWINS control panels
     twins_scan.py         live 1-D TWINS interferogram scan
-    measure_hyperspectral.py  the hyperspectral experiment + HyperViewer
+    measure_extended.py   the extended-resolution experiment (Measure tab)
+    measure_hyperspectral.py  HyperViewer + live interferogram plot
   instruments/          drivers + shared DSP
-    stage_driver.py       Thorlabs delay stage (KDC101)
-    rotator_stage.py      Thorlabs rotation mount (KDC101, degrees)
+    stage_driver.py       Thorlabs KDC101 linear stages (KinesisStage, mm)
     twins_stage.py        NIREOS TWINS SmarAct SCU3D driver
     subtwinslv.py         step-scan engine (scan / scan_cube)
     hyperspectral.py      2-D per-pixel DFT (compute_hyperspectral)
@@ -125,7 +128,7 @@ Python 3.8–3.12, 64-bit. `mock` mode needs only the pip packages. The real
 hardware additionally needs, installed system-wide:
 
 - **Pleora eBUS runtime** — `C:\Program Files\Common Files\Pleora\eBUS SDK\PvDotNet.dll` (camera)
-- **Thorlabs Kinesis** — `C:\Program Files\Thorlabs\Kinesis` (delay stage + rotator, KDC101)
+- **Thorlabs Kinesis** — `C:\Program Files\Thorlabs\Kinesis` (three MTS50-Z8 motors, KDC101)
 - **SmarAct SCU3D** — `SCU3DControl.dll` (TWINS wedge)
 - **Hamamatsu Orca**
 - **Smaract MSC2** - 'C:\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip'
@@ -141,17 +144,15 @@ Work through the sections in order. Each one says *what* to change, *where* it
 lives, and *how to find the right value for your rig*. You can run
 `python main.py --mode mock` at any point: mock mode ignores all of it.
 
-### 1. Thorlabs serial numbers (rotator + delay stage)
+### 1. Thorlabs serial numbers (three motors)
 
-The rig has **two KDC101 K-Cube controllers** — one for the rotation mount, one
-for the delay stage. The rotator is pinned to its serial so the two can never
-grab each other's controller; the delay stage then takes whichever other KDC101
-is present.
-
-| What | Where | Value on the original bench |
-|---|---|---|
-| Rotator serial | `ui/stages.py`, in `StagesPanel.__init__` (~line 88) | `RotatorStage(serial="27267060")` |
-| Delay-stage serial | not pinned — `_delay_connect()` in `ui/stages.py` auto-picks the first KDC101 that is *not* the rotator | — |
+The rig has **three identical KDC101 K-Cube controllers**, one per MTS50-Z8
+motor. They are told apart only by serial number: type each motor's serial in
+its field on the Thorlabs Motors tab once — it is remembered per PC (QSettings
+`MIR_CAMERA/Stages`) and restored at the next start. First-run defaults live in
+`THORLABS_MOTORS` in `ui/stages.py`. An empty field auto-picks the first free
+K-Cube, skipping the other motors' serials and any serial listed in
+`OTHER_KINESIS_SERIALS`.
 
 **Find your serials.** Close the Kinesis app first (see section 3 — USB access
 is exclusive), then:
@@ -162,31 +163,27 @@ python -c "from pylablib.devices import Thorlabs; print(Thorlabs.list_kinesis_de
 
 This prints `(serial, description)` for every attached Thorlabs controller. The
 serial is also printed on the label on the KDC101 itself and shown in the
-Kinesis device list. Put the rotator's serial into `ui/stages.py`.
+Kinesis device list.
 
-If your bench has **more than two** KDC101 controllers, pin the delay stage as
-well: in `_delay_connect()` pass the serial explicitly, e.g.
-`self.delay.connect(simulate=sim, serial="12345678", exclude=other)`.
-
-> **Symptom of a wrong serial:** `[RotatorStage] no hardware found` even though
-> the Kinesis app moves the mount perfectly. The driver tried to open a serial
-> that is not attached.
+> **Symptom of a wrong serial:** the motor's status line reports
+> `serial ... not found (Thorlabs devices present: [...])` even though the
+> Kinesis app moves the stage perfectly. The list in the message shows the
+> serials that are actually attached.
 
 ### 2. Actuator type assigned to each controller
 
 A KDC101 only knows its counts-per-degree (or per-mm) once an **actuator is
 assigned to it in the Kinesis app** — select the controller, then
-*Settings → Device*, and pick the actuator: the rotation mount (e.g. `PRM1Z8`)
-or the delay actuator (e.g. `Z825B`). This is a one-time setup per controller,
-per PC.
+*Settings → Device*, and pick the actuator (`MTS50-Z8` for all three motors).
+This is a one-time setup per controller, per PC.
 
 The same name must then appear in the code, where it is pushed to the
 controller as `DeviceSettingsName`:
 
 | What | Where | Default |
 |---|---|---|
-| Rotation-mount type | `RotatorStage.__init__`, `instruments/rotator_stage.py` (~line 49) | `stage_name="PRM1-Z8"` |
-| Delay-actuator counts/mm | `DEFAULT_COUNTS_PER_MM`, `instruments/stage_driver.py` (~line 43) | `20000` |
+| Stage type | `THORLABS_STAGE_NAME`, `ui/stages.py` | `"MTS50-Z8"` |
+| Counts/mm + travel per stage type | `STAGE_TABLE`, `instruments/stage_driver.py` | `34304` counts/mm, `50` mm |
 
 > **Symptoms of a wrong actuator:** "Go to" lands at the wrong angle, jog moves
 > by random amounts, or the position readout shows huge numbers — the values are
@@ -195,7 +192,7 @@ controller as `DeviceSettingsName`:
 
 ### 3. Thorlabs libraries: which backend, which folder, which bitness
 
-The two Thorlabs drivers try three backends in order and use the first that
+The Thorlabs driver tries three backends in order and uses the first that
 works: **pylablib → thorlabs_apt → pythonnet (.NET Kinesis DLLs)**.
 
 **The simplest setup is `pip install pylablib`.** It talks to the KDC101 over
@@ -205,12 +202,11 @@ is enough.
 
 If you rely on the **.NET backend** instead, two things must line up:
 
-1. **The folder.** Both drivers hard-code
+1. **The folder.** The driver hard-codes
    `C:\Program Files\Thorlabs\Kinesis` — see `_connect_dotnet()` in
-   `instruments/rotator_stage.py` (~line 113) and `instruments/stage_driver.py`
-   (~line 115). The **32-bit** Kinesis installs to
+   `instruments/stage_driver.py`. The **32-bit** Kinesis installs to
    `C:\Program Files (x86)\Thorlabs\Kinesis` instead; if that is what you have,
-   both lines must be changed.
+   that line must be changed.
 2. **The bitness.** A 64-bit Python **cannot** load the 32-bit Kinesis DLLs, no
    matter how correct the path is. With 64-bit Python (the normal case here),
    install the **64-bit Kinesis**, which lands in
@@ -323,8 +319,8 @@ python -c "import smaract.ctl as ctl; print(ctl.FindDevices())"
 ```
 
 Then, in the app: connect each stage with **Simulate** unticked, home the
-rotator and the delay stage, and confirm the position readouts are in degrees
-and millimetres rather than huge raw counts. Finally run one short TWINS scan
+three motors, and confirm the position readouts are in millimetres rather than
+huge raw counts. Finally run one short TWINS scan
 and check that the spectrum peaks where your source actually emits — that is the
 quickest test that `parameters_cal.txt` belongs to your interferometer.
 
