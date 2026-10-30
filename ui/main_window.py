@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
 
 from ui.stages import StagesPanel
 from ui.twins_scan import TwinsScanPanel
-from ui.measure_hyperspectral import MeasurePanel
+from ui.measure_extended import MeasurePanel
 
 
 class MainWindow(QMainWindow):
@@ -103,9 +103,7 @@ class MainWindow(QMainWindow):
             self._build_save_group(),
         ]), "Camera")
         controls_tabs.addTab(
-            self._make_tab([self.stages_panel.delay_group]), "Thorlabs Stage")
-        controls_tabs.addTab(
-            self._make_tab([self.stages_panel.rotator_group]), "Rotator")
+            self._make_tab([self.stages_panel.thorlabs_group]), "Thorlabs Motors")
         self.twins_scan_panel = TwinsScanPanel(
             self.stages_panel.twins_ctl,
             frame_source=lambda: self.latest_frame,

@@ -1,12 +1,19 @@
-"""Stage control panels for the GUI: Thorlabs delay stage + TWINS (SmarAct).
+"""Stage control panels for the GUI: Thorlabs motors + TWINS (SmarAct).
 
-Connect and manual jog/move for both stages. Blocking operations (connect,
+Connect and manual jog/move for every stage. Blocking operations (connect,
 home, move) run in background threads so the UI never freezes; position is
 polled on a timer. A "Simulate" checkbox lets you exercise the controls with
 no hardware (default ON until the stages are wired up).
 
+Thorlabs motors: THREE identical MTS50-Z8 stages, each on its own KDC101.
+The controllers are told apart only by serial number, so every motor has its
+own serial field (pre-filled from THORLABS_MOTORS below) and is pinned to it on
+connect; on auto-pick (empty serial) the serials of the other motors and of
+any other K-Cube on the PC (OTHER_KINESIS_SERIALS) are excluded so two drivers
+can never open the same controller.
+
 The actual TWINS interferogram scan (sweep stage + read camera ROI -> spectrum)
-is a later step; this panel covers the connections + manual control.
+lives in its own panel; this one covers the connections + manual control.
 """
 from __future__ import annotations
 
@@ -14,13 +21,27 @@ import threading
 
 from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
-    QCheckBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-    QVBoxLayout, QWidget,
+    QCheckBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
-from instruments.stage_driver import DelayStage
-from instruments.rotator_stage import RotatorStage
+from instruments.stage_driver import KinesisStage
 from instruments.twins_stage import TwinsStage, TRAVEL_MIN_MM, TRAVEL_MAX_MM
+
+# (label, KDC101 serial number) for each of the three MTS50-Z8 motors. These
+# are only the FIRST-RUN defaults: the serial typed in the panel is remembered
+# per PC (QSettings "MIR_CAMERA/Stages", same store as the other panels) and
+# restored at the next start. An empty serial means "first free Thorlabs
+# device" (the other motors' and the rotator's serials are excluded).
+THORLABS_MOTORS = [
+    ("Motor 1", ""),
+    ("Motor 2", ""),
+    ("Motor 3", ""),
+]
+THORLABS_STAGE_NAME = "MTS50-Z8"
+# Other Thorlabs K-Cubes that may be plugged into this PC (e.g. the PRM1-Z8
+# rotator's KDC101): never auto-picked for a motor.
+OTHER_KINESIS_SERIALS = ["27267060"]
 
 
 class StageController(QtCore.QObject):
@@ -40,7 +61,9 @@ class StageController(QtCore.QObject):
     def busy(self) -> bool:
         return self._busy
 
-    def run(self, fn, done_msg: str = "") -> None:
+    def run(self, fn, done_msg="") -> None:
+        """Run ``fn`` on a worker thread. ``done_msg`` is a string or a callable
+        evaluated after ``fn`` succeeds (so it can report e.g. the serial)."""
         if self._busy:
             return
         self._busy = True
@@ -49,8 +72,9 @@ class StageController(QtCore.QObject):
         def _work():
             try:
                 fn()
-                if done_msg:
-                    self.status.emit(done_msg)
+                msg = done_msg() if callable(done_msg) else done_msg
+                if msg:
+                    self.status.emit(msg)
             except Exception as e:  # noqa: BLE001
                 self.status.emit(f"error: {e}")
             finally:
@@ -73,221 +97,195 @@ class StageController(QtCore.QObject):
 
 
 class StagesPanel(QWidget):
-    """Owns the delay-stage and TWINS-stage drivers, controllers and the
-    position-poll timer. The two control groups (``delay_group`` and
+    """Owns the Thorlabs-motor and TWINS-stage drivers, controllers and the
+    position-poll timer. The control groups (``thorlabs_group``,
     ``twins_group``) are exposed so they can be placed into separate tabs;
     this widget itself stays hidden and just keeps the timer/threads alive.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self.delay = DelayStage()
+        # Three identical Thorlabs motors (MTS50-Z8 on KDC101), told apart by
+        # serial number. Serials are remembered across runs.
+        self._settings = QtCore.QSettings("MIR_CAMERA", "Stages")
+        self.motors = [
+            KinesisStage(serial=self._load_motor_serial(i, default) or None,
+                         stage_name=THORLABS_STAGE_NAME, name=label)
+            for i, (label, default) in enumerate(THORLABS_MOTORS)]
+        self.motor_ctls = [
+            StageController(m, lambda d: f"{d.get_position_mm():.4f} mm")
+            for m in self.motors]
+        # Motor 1 doubles as the "delay" axis the Measure panel's Z-scan drives.
+        self.delay = self.motors[0]
+        self.delay_ctl = self.motor_ctls[0]
+
         self.twins = TwinsStage()
-        # This rig has TWO KDC101 controllers; pin the rotator to its serial so
-        # it never collides with the delay stage's KDC101 (and vice-versa).
-        self.rotator = RotatorStage(serial="27267060")
-        self.delay_ctl = StageController(
-            self.delay,
-            lambda d: f"{d.get_position_mm():.4f} mm")
         self.twins_ctl = StageController(
             self.twins, lambda d: f"{d.get_position():.4f} mm")
-        self.rotator_ctl = StageController(
-            self.rotator, lambda d: f"{d.get_position_deg():.4f} deg")
 
-        self.delay_group = self._build_delay_group()
+        self._mw = []                       # per-motor widget dicts
+        self.motor_groups = [self._build_motor_group(i) for i in range(len(self.motors))]
+        self.thorlabs_group = self._build_thorlabs_group()
         self.twins_group = self._build_twins_group()
-        self.rotator_group = self._build_rotator_group()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._poll)
         self.timer.start(500)
 
-    # -- Thorlabs delay stage ------------------------------------------------
-    def _build_delay_group(self) -> QGroupBox:
-        g = QGroupBox("Thorlabs Stage (mm)")
-        v = QVBoxLayout(g)
+    # -- Thorlabs motors (KDC101 + MTS50-Z8, mm) -----------------------------
+    def _build_thorlabs_group(self) -> QWidget:
+        """Container stacking the three motor groups (one tab)."""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        for g in self.motor_groups:
+            v.addWidget(g)
+        v.addStretch(1)
+        return w
 
-        self.d_sim = QCheckBox("Simulate (no hardware)")
-        self.d_sim.setChecked(True)
-        v.addWidget(self.d_sim)
+    def _build_motor_group(self, i: int) -> QGroupBox:
+        drv, ctl = self.motors[i], self.motor_ctls[i]
+        g = QGroupBox(f"{drv.name} ({drv.stage_name}, mm)")
+        v = QVBoxLayout(g)
+        w = {}
+
+        ser = QHBoxLayout()
+        ser.addWidget(QLabel("Serial"))
+        w["serial"] = QLineEdit(drv.preferred_serial or "")
+        w["serial"].setPlaceholderText("KDC101 serial (empty = first free)")
+        w["serial"].setToolTip("Serial number printed on this motor's KDC101. "
+                               "Three identical motors are told apart only by it.")
+        # Remember the serial as soon as it is edited (and again on connect).
+        w["serial"].editingFinished.connect(lambda i=i: self._save_motor_serial(i))
+        ser.addWidget(w["serial"])
+        v.addLayout(ser)
+
+        w["sim"] = QCheckBox("Simulate (no hardware)")
+        w["sim"].setChecked(True)
+        v.addWidget(w["sim"])
 
         row = QHBoxLayout()
-        self.d_connect = QPushButton("Connect")
-        self.d_connect.clicked.connect(self._delay_connect)
-        self.d_home = QPushButton("Home")
-        self.d_home.clicked.connect(
-            lambda: self.delay_ctl.run(self.delay.home, "homed"))
-        row.addWidget(self.d_connect)
-        row.addWidget(self.d_home)
+        w["connect"] = QPushButton("Connect")
+        w["connect"].clicked.connect(lambda _=False, i=i: self._motor_connect(i))
+        w["home"] = QPushButton("Home")
+        w["home"].clicked.connect(lambda _=False, i=i: ctl.run(drv.home, "homed"))
+        row.addWidget(w["connect"])
+        row.addWidget(w["home"])
         v.addLayout(row)
 
-        self.d_pos = QLabel("-- mm")
-        self.d_pos.setStyleSheet("font-weight:600;")
-        v.addWidget(self.d_pos)
+        w["pos"] = QLabel("-- mm")
+        w["pos"].setStyleSheet("font-weight:600;")
+        v.addWidget(w["pos"])
 
         go = QHBoxLayout()
         go.addWidget(QLabel("Go to"))
-        self.d_goto = QDoubleSpinBox()
-        self.d_goto.setRange(0.0, 300.0)
-        self.d_goto.setDecimals(4)
-        self.d_goto.setSingleStep(0.1)
-        self.d_goto.setSuffix(" mm")
-        go.addWidget(self.d_goto)
-        self.d_go = QPushButton("Go")
-        self.d_go.clicked.connect(
-            lambda: self.delay_ctl.run(
-                lambda: self.delay.move_to_mm(self.d_goto.value()),
-                f"moved to {self.d_goto.value():.4f} mm"))
-        go.addWidget(self.d_go)
+        w["goto"] = QDoubleSpinBox()
+        w["goto"].setRange(0.0, drv.travel_mm)
+        w["goto"].setDecimals(4)
+        w["goto"].setSingleStep(0.1)
+        w["goto"].setSuffix(" mm")
+        w["goto"].setToolTip(f"Travel 0 .. {drv.travel_mm:g} mm")
+        go.addWidget(w["goto"])
+        w["go"] = QPushButton("Go")
+        w["go"].clicked.connect(lambda _=False, i=i: self._motor_goto(i))
+        go.addWidget(w["go"])
         v.addLayout(go)
 
         jog = QHBoxLayout()
         jog.addWidget(QLabel("Jog"))
-        self.d_step = QDoubleSpinBox()
-        self.d_step.setRange(0.0, 50.0)
-        self.d_step.setDecimals(4)
-        self.d_step.setSingleStep(0.01)
-        self.d_step.setValue(0.1)
-        self.d_step.setSuffix(" mm")
-        jog.addWidget(self.d_step)
-        self.d_minus = QPushButton("-")
-        self.d_minus.setFixedWidth(32)
-        self.d_minus.clicked.connect(
-            lambda: self.delay_ctl.run(
-                lambda: self.delay.move_relative_mm(-self.d_step.value())))
-        self.d_plus = QPushButton("+")
-        self.d_plus.setFixedWidth(32)
-        self.d_plus.clicked.connect(
-            lambda: self.delay_ctl.run(
-                lambda: self.delay.move_relative_mm(self.d_step.value())))
-        jog.addWidget(self.d_minus)
-        jog.addWidget(self.d_plus)
+        w["step"] = QDoubleSpinBox()
+        w["step"].setRange(0.0, drv.travel_mm)
+        w["step"].setDecimals(4)
+        w["step"].setSingleStep(0.01)
+        w["step"].setValue(0.1)
+        w["step"].setSuffix(" mm")
+        jog.addWidget(w["step"])
+        w["minus"] = QPushButton("-")
+        w["minus"].setFixedWidth(32)
+        w["minus"].clicked.connect(lambda _=False, i=i: self._motor_jog(i, -1.0))
+        w["plus"] = QPushButton("+")
+        w["plus"].setFixedWidth(32)
+        w["plus"].clicked.connect(lambda _=False, i=i: self._motor_jog(i, +1.0))
+        jog.addWidget(w["minus"])
+        jog.addWidget(w["plus"])
         v.addLayout(jog)
 
-        self.d_status = QLabel("offline")
-        self.d_status.setStyleSheet("color:#888; font-size:11px;")
-        self.d_status.setWordWrap(True)
-        v.addWidget(self.d_status)
+        w["status"] = QLabel("offline")
+        w["status"].setStyleSheet("color:#888; font-size:11px;")
+        w["status"].setWordWrap(True)
+        v.addWidget(w["status"])
 
-        self.delay_ctl.position.connect(self.d_pos.setText)
-        self.delay_ctl.status.connect(self.d_status.setText)
-        self.delay_ctl.busy_changed.connect(lambda *_: self._refresh_delay())
-        self._refresh_delay()
+        self._mw.append(w)
+        ctl.position.connect(w["pos"].setText)
+        ctl.status.connect(w["status"].setText)
+        ctl.busy_changed.connect(lambda *_, i=i: self._refresh_motor(i))
+        self._refresh_motor(i)
         return g
 
-    def _delay_connect(self) -> None:
-        if self.delay.is_connected:
-            self.delay_ctl.run(self.delay.disconnect, "disconnected")
-        else:
-            sim = self.d_sim.isChecked()
-            # Exclude the rotator's KDC101 so auto-pick never grabs it.
-            other = [self.rotator.preferred_serial] if self.rotator.preferred_serial else None
-            self.delay_ctl.run(
-                lambda: self.delay.connect(simulate=sim, exclude=other), "connected")
+    def _motor_serial(self, i: int) -> str:
+        return self._mw[i]["serial"].text().strip()
 
-    def _refresh_delay(self) -> None:
-        conn = self.delay.is_connected
-        busy = self.delay_ctl.busy
-        self.d_connect.setText("Disconnect" if conn else "Connect")
-        self.d_sim.setEnabled(not conn and not busy)
-        for w in (self.d_home, self.d_go, self.d_minus, self.d_plus,
-                  self.d_goto, self.d_step):
-            w.setEnabled(conn and not busy)
-        self.d_connect.setEnabled(not busy)
+    def _load_motor_serial(self, i: int, default: str = "") -> str:
+        return str(self._settings.value(f"motor{i}/serial", default, type=str)).strip()
+
+    def _save_motor_serial(self, i: int) -> None:
+        self._settings.setValue(f"motor{i}/serial", self._motor_serial(i))
+        self._settings.sync()
+
+    def _motor_connect(self, i: int) -> None:
+        drv, ctl, w = self.motors[i], self.motor_ctls[i], self._mw[i]
+        if drv.is_connected:
+            ctl.run(drv.disconnect, "disconnected")
+            return
+        sim = w["sim"].isChecked()
+        serial = self._motor_serial(i) or None
+        drv.preferred_serial = serial
+        self._save_motor_serial(i)
+        # Never let an auto-pick grab another motor's KDC101 (or any other
+        # K-Cube on the PC): exclude their serials and whatever is already open.
+        others = [self._motor_serial(j) for j in range(len(self.motors)) if j != i]
+        others += [m.serial for m in self.motors if m.is_connected and m is not drv]
+        others += list(OTHER_KINESIS_SERIALS)
+
+        def _connect():
+            if not drv.connect(serial=serial, simulate=sim, exclude=others):
+                raise RuntimeError(
+                    f"no Thorlabs device for {drv.name}"
+                    + (f" (serial {serial})" if serial else "") + " -- see console")
+
+        ctl.run(_connect, lambda: f"connected via {drv.backend} (serial {drv.serial})")
+
+    def _motor_goto(self, i: int) -> None:
+        drv, ctl, w = self.motors[i], self.motor_ctls[i], self._mw[i]
+        target = w["goto"].value()
+
+        def _move():
+            if not drv.move_to_mm(target):
+                raise RuntimeError("move refused (not homed or outside travel)")
+
+        ctl.run(_move, f"moved to {target:.4f} mm")
+
+    def _motor_jog(self, i: int, sign: float) -> None:
+        drv, ctl, w = self.motors[i], self.motor_ctls[i], self._mw[i]
+        delta = sign * w["step"].value()
+
+        def _move():
+            if not drv.move_relative_mm(delta):
+                raise RuntimeError("move refused (not homed or outside travel)")
+
+        ctl.run(_move, f"jogged {delta:+.4f} mm")
+
+    def _refresh_motor(self, i: int) -> None:
+        drv, ctl, w = self.motors[i], self.motor_ctls[i], self._mw[i]
+        conn, busy = drv.is_connected, ctl.busy
+        w["connect"].setText("Disconnect" if conn else "Connect")
+        w["connect"].setEnabled(not busy)
+        w["sim"].setEnabled(not conn and not busy)
+        w["serial"].setEnabled(not conn and not busy)
+        for key in ("home", "go", "minus", "plus", "goto", "step"):
+            w[key].setEnabled(conn and not busy)
         if not conn:
-            self.d_pos.setText("-- mm")
-
-    # -- Thorlabs rotator (KDC101, degrees) ---------------------------------
-    def _build_rotator_group(self) -> QGroupBox:
-        g = QGroupBox("Thorlabs Rotator (deg)")
-        v = QVBoxLayout(g)
-
-        self.r_sim = QCheckBox("Simulate (no hardware)")
-        self.r_sim.setChecked(True)
-        v.addWidget(self.r_sim)
-
-        row = QHBoxLayout()
-        self.r_connect = QPushButton("Connect")
-        self.r_connect.clicked.connect(self._rotator_connect)
-        self.r_home = QPushButton("Home")
-        self.r_home.clicked.connect(
-            lambda: self.rotator_ctl.run(self.rotator.home, "homed"))
-        row.addWidget(self.r_connect)
-        row.addWidget(self.r_home)
-        v.addLayout(row)
-
-        self.r_pos = QLabel("-- deg")
-        self.r_pos.setStyleSheet("font-weight:600;")
-        v.addWidget(self.r_pos)
-
-        go = QHBoxLayout()
-        go.addWidget(QLabel("Go to"))
-        self.r_goto = QDoubleSpinBox()
-        self.r_goto.setRange(0.0, 360.0)
-        self.r_goto.setDecimals(4)
-        self.r_goto.setSingleStep(1.0)
-        self.r_goto.setSuffix(" deg")
-        go.addWidget(self.r_goto)
-        self.r_go = QPushButton("Go")
-        self.r_go.clicked.connect(
-            lambda: self.rotator_ctl.run(
-                lambda: self.rotator.move_to_deg(self.r_goto.value()),
-                f"moved to {self.r_goto.value():.4f} deg"))
-        go.addWidget(self.r_go)
-        v.addLayout(go)
-
-        jog = QHBoxLayout()
-        jog.addWidget(QLabel("Jog"))
-        self.r_step = QDoubleSpinBox()
-        self.r_step.setRange(0.0, 180.0)
-        self.r_step.setDecimals(3)
-        self.r_step.setSingleStep(0.5)
-        self.r_step.setValue(1.0)
-        self.r_step.setSuffix(" deg")
-        jog.addWidget(self.r_step)
-        self.r_minus = QPushButton("−")
-        self.r_minus.setFixedWidth(32)
-        self.r_minus.clicked.connect(
-            lambda: self.rotator_ctl.run(
-                lambda: self.rotator.move_relative_deg(-self.r_step.value())))
-        self.r_plus = QPushButton("+")
-        self.r_plus.setFixedWidth(32)
-        self.r_plus.clicked.connect(
-            lambda: self.rotator_ctl.run(
-                lambda: self.rotator.move_relative_deg(self.r_step.value())))
-        jog.addWidget(self.r_minus)
-        jog.addWidget(self.r_plus)
-        v.addLayout(jog)
-
-        self.r_status = QLabel("offline")
-        self.r_status.setStyleSheet("color:#888; font-size:11px;")
-        self.r_status.setWordWrap(True)
-        v.addWidget(self.r_status)
-
-        self.rotator_ctl.position.connect(self.r_pos.setText)
-        self.rotator_ctl.status.connect(self.r_status.setText)
-        self.rotator_ctl.busy_changed.connect(lambda *_: self._refresh_rotator())
-        self._refresh_rotator()
-        return g
-
-    def _rotator_connect(self) -> None:
-        if self.rotator.is_connected:
-            self.rotator_ctl.run(self.rotator.disconnect, "disconnected")
-        else:
-            sim = self.r_sim.isChecked()
-            self.rotator_ctl.run(lambda: self.rotator.connect(simulate=sim), "connected")
-
-    def _refresh_rotator(self) -> None:
-        conn = self.rotator.is_connected
-        busy = self.rotator_ctl.busy
-        self.r_connect.setText("Disconnect" if conn else "Connect")
-        self.r_sim.setEnabled(not conn and not busy)
-        for w in (self.r_home, self.r_go, self.r_minus, self.r_plus,
-                  self.r_goto, self.r_step):
-            w.setEnabled(conn and not busy)
-        self.r_connect.setEnabled(not busy)
-        if not conn:
-            self.r_pos.setText("-- deg")
+            w["pos"].setText("-- mm")
 
     # -- TWINS (SmarAct) stage ----------------------------------------------
     def _build_twins_group(self) -> QGroupBox:
@@ -389,9 +387,9 @@ class StagesPanel(QWidget):
             self.t_pos.setText("-- mm")
 
     def _poll(self) -> None:
-        self.delay_ctl.poll()
+        for ctl in self.motor_ctls:
+            ctl.poll()
         self.twins_ctl.poll()
-        self.rotator_ctl.poll()
 
     def freeze(self, frozen: bool) -> None:
         """Pause position polling and lock the manual controls during a Measure
@@ -400,12 +398,11 @@ class StagesPanel(QWidget):
             self.timer.stop()
         else:
             self.timer.start(500)
-        self.delay_group.setEnabled(not frozen)
+        self.thorlabs_group.setEnabled(not frozen)
         self.twins_group.setEnabled(not frozen)
-        self.rotator_group.setEnabled(not frozen)
 
     def shutdown(self) -> None:
-        for drv in (self.delay, self.twins, self.rotator):
+        for drv in (*self.motors, self.twins):
             try:
                 if drv.is_connected:
                     drv.disconnect()
