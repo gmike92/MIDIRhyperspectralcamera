@@ -230,7 +230,7 @@ class HyperspectralProcessor:
                                expected_zero_mm=None, search_mm=None,
                                apod_type="happ-genzel",
                                ft_window_mm=None,
-                               positions_calibrated=False, center_method="envelope",
+                               positions_calibrated=False, center_method="barycenter",
                                complex_out=False):
         """
         Compute per-pixel DFT on a (n_pos, h, w) datacube.
@@ -241,9 +241,10 @@ class HyperspectralProcessor:
         once, for callers that need the quadratures (e.g. the Stokes viewer).
 
         `center_method`: how the apodization ZPD centre is found --
-        "envelope" (default) = one Hilbert-envelope centre-burst for the whole
-        field (signed spatial sum); "barycenter" = an independent I^2 barycentre
-        per pixel, so a ZPD that varies across the field is followed per pixel.
+        "barycenter" (default) = an independent I^2 barycentre per pixel, so a
+        ZPD that varies across the field is followed per pixel; "envelope" =
+        one Hilbert-envelope centre-burst for the whole field (signed spatial
+        sum), more robust on a noisy frame but field-wide, so a crop moves it.
         If reference_cube is provided, extracts spectral phase and returns the Absorptive (Real) part.
 
         `positions_calibrated`: set True when `positions` is ALREADY the
@@ -386,7 +387,7 @@ class HyperspectralProcessor:
                             apod_type="happ-genzel",
                             expected_zero_mm=None, search_mm=None,
                             ft_window_mm=None, positions_calibrated=False,
-                            reference_cube=None, center_method="envelope"):
+                            reference_cube=None, center_method="barycenter"):
         """Per-pixel COMPLEX DFT at ONE wavelength -> (complex_map (h,w), info).
 
         The saved spectrum cube keeps only the DFT magnitude (np.abs), throwing
